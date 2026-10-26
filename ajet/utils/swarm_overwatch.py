@@ -19,9 +19,16 @@ from loguru import logger
 
 from ajet.tuner_lib.experimental.swarm_overwatch_utils import CurrentBatchRolloutPoolInformation
 
+VERBOSE_LOG_TTL_SECONDS = 30.0
+
 
 class SwarmOverwatch:
     """Real-time monitoring interface for swarm rollout pool"""
+
+    REFRESH_TRIGGER_KEYWORDS = (
+        "broken pipe", "disconnected", "connection reset",
+        "connection closed", "connection aborted", "bad file descriptor",
+    )
 
     def __init__(self, server_url: str, refresh_interval: float = 2.0):
         """
@@ -37,7 +44,33 @@ class SwarmOverwatch:
         self.last_update_time = None
         self.error_count = 0
         self.total_requests = 0
-        self._httpx_client = httpx.Client(timeout=5.0)
+        # Disable keep-alive: each poll opens a fresh TCP connection so the kernel
+        # re-picks a worker every time. Without this, a long-lived connection can
+        # stick to a stale/zombie worker after a server restart and silently keep
+        # returning frozen state.
+        self._httpx_client = httpx.Client(
+            timeout=5.0,
+            limits=httpx.Limits(max_keepalive_connections=0, keepalive_expiry=0),
+            headers={"Connection": "close"},
+        )
+        self._verbose_logs: list = []  # list of dicts {timestamp, tag, message}
+
+    def _refresh_http_client(self):
+        """Close the existing httpx client and create a fresh one."""
+        try:
+            self._httpx_client.close()
+        except Exception:
+            pass
+        self._httpx_client = httpx.Client(
+            timeout=5.0,
+            limits=httpx.Limits(max_keepalive_connections=0, keepalive_expiry=0),
+            headers={"Connection": "close"},
+        )
+        logger.warning("swarm overwatch httpx client refreshed.")
+
+    def _should_refresh_client_on_error(self, error: Exception) -> bool:
+        msg = str(error).lower()
+        return any(k in msg for k in self.REFRESH_TRIGGER_KEYWORDS)
 
     def fetch_pool_info(self) -> Optional[CurrentBatchRolloutPoolInformation]:
         """Fetch current batch rollout pool information from server"""
@@ -53,8 +86,34 @@ class SwarmOverwatch:
             return data
         except Exception as e:
             self.error_count += 1
-            # logger.error(f"Failed to fetch pool info: {e}")
+            if self._should_refresh_client_on_error(e):
+                self._refresh_http_client()
             return None
+
+    def fetch_verbose_logs(self) -> None:
+        """Fetch verbose log entries from server. Failures are silent."""
+        try:
+            response = self._httpx_client.get(
+                f"{self.server_url}/get_verbose_logs",
+                timeout=2.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            self._verbose_logs = data.get("entries", [])
+        except Exception as e:
+            if self._should_refresh_client_on_error(e):
+                self._refresh_http_client()
+            # Keep previously fetched logs; TTL filter still applies at render time.
+
+    def _latest_verbose_entry(self) -> Optional[dict]:
+        """Return the most recent non-expired verbose log entry, or None."""
+        now = time.time()
+        cutoff = now - VERBOSE_LOG_TTL_SECONDS
+        fresh = [e for e in self._verbose_logs if e.get("timestamp", 0) >= cutoff]
+        if not fresh:
+            return None
+        fresh.sort(key=lambda e: e.get("timestamp", 0))
+        return fresh[-1]
 
     def create_header(
         self, info: Optional[CurrentBatchRolloutPoolInformation] = None
@@ -69,18 +128,39 @@ class SwarmOverwatch:
 
         header_text = Text()
         header_text.append("AgentJet Swarm Overwatch", style="bold cyan")
-        header_text.append(f"\nServer: {self.server_url}", style="dim")
+        header_text.append(f"  |  Server: {self.server_url}", style="dim")
+
+        instr = info.swarm_client_instruction if info else {}
+        active_clients = instr.get("active_clients", [])
+        agreed = sum(1 for c in active_clients if c.get("allowed_sync_weight"))
+        total = len(active_clients)
+        header_text.append(f"\nActive Clients: {total}", style="bold white")
+        if total:
+            parts = [f"{c.get('client_uuid','?')[:8]}{'✓' if c.get('allowed_sync_weight') else ''}" for c in active_clients[:8]]
+            suffix = f", +{total - 8} more" if total > 8 else ""
+            header_text.append(f"  [{', '.join(parts)}{suffix}]", style="cyan")
+
         header_text.append(f"\nCurrent Time: {now}", style="green")
         header_text.append(f"  |  Last Update: {last_update}", style="yellow")
         header_text.append(f"  |  Refresh: {self.refresh_interval}s", style="blue")
-        header_text.append(f"\nRequests: {self.total_requests}", style="magenta")
-        # header_text.append(
-        #     f"  |  Errors: {self.error_count}",
-        #     style="red" if self.error_count > 0 else "green",
-        # )
+        # Inline the most recent verbose log entry (last 30s, overwritten by newer).
+        # When a verbose log is active, hide the "Requests: xxx" line to avoid clutter.
+        latest = self._latest_verbose_entry()
+        if latest is not None:
+            age = max(0.0, time.time() - latest.get("timestamp", time.time()))
+            tag = latest.get("tag") or ""
+            msg = latest.get("message", "")
+            prefix = f"<{tag}> " if tag else ""
+            header_text.append(f"\n{prefix}{msg}  ({age:.0f}s ago)", style="bright_magenta")
+        else:
+            header_text.append(f"\nRequests: {self.total_requests}", style="magenta")
 
         # Add engine status and global step if available
         if info:
+            if info.training_model_path:
+                header_text.append(
+                    f"\nTraining Model: {info.training_model_path}", style="bold white"
+                )
             if info.engine_status:
                 header_text.append(
                     f"\nEngine Status: {info.engine_status}", style="bold yellow"
@@ -139,6 +219,13 @@ class SwarmOverwatch:
             info.sample_collection_method
             == "rollout_until_finish_enough_non_dummy_tasks"
         )
+        highlight_any_agree = (
+            info.sample_collection_method == "rollout_until_any_client_agree_sync_weight"
+        )
+        highlight_all_agree = (
+            info.sample_collection_method == "rollout_until_all_clients_agree_sync_weight"
+        )
+        highlight_agree = highlight_any_agree or highlight_all_agree
 
         # Episodes
         ep_cur, ep_tgt, ep_pct = self.create_progress_bar(
@@ -219,6 +306,30 @@ class SwarmOverwatch:
             "-",
             "-"
         )
+
+        # Clients agree sync weight (only shown for agree_sync_weight methods)
+        if highlight_agree:
+            instr = info.swarm_client_instruction if info.swarm_client_instruction else {}
+            active_clients = instr.get("active_clients", [])
+            total_clients = len(active_clients)
+            agreed_clients = sum(1 for c in active_clients if c.get("allowed_sync_weight"))
+            # Target depends on mode: any=1, all=total
+            if highlight_any_agree:
+                agree_target = 1 if total_clients > 0 else 0
+            else:
+                agree_target = total_clients
+            agree_pct = (agreed_clients / agree_target * 100) if agree_target > 0 else 0.0
+            agree_bar = self._create_text_bar(agree_pct)
+            agree_metric = "-> *Clients Agree Sync Weight (chosen)*"
+            agree_style = "bold green"
+            table.add_row(
+                f"[{agree_style}]{agree_metric}[/{agree_style}]",
+                f"{agreed_clients:,}",
+                f"{agree_target:,}",
+                f"{agree_pct:.1f}%",
+                agree_bar,
+                style=agree_style,
+            )
 
         return table
 
@@ -548,6 +659,7 @@ class SwarmOverwatch:
                 try:
                     # Fetch latest data
                     info = self.fetch_pool_info()
+                    self.fetch_verbose_logs()
 
                     # Update display
                     live.update(self.create_dashboard(info))

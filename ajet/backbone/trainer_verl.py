@@ -13,22 +13,22 @@
 # limitations under the License.
 
 
+import asyncio
+import os
 import uuid
 from collections import defaultdict
 from pprint import pprint
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import hydra
 import numpy as np
 import torch
 from beast_logger import print_dict
 from loguru import logger
-from omegaconf import OmegaConf
 from tqdm import tqdm
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.single_controller.ray import RayClassWithInitArgs
-from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -39,15 +39,14 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
-    Role,
     apply_kl_penalty,
     compute_response_mask,
 )
-from verl.trainer.ppo.reward import compute_reward
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.ray_utils import auto_await
 
 from ajet.backbone.warm_up import warm_up_process
 from ajet.context_tracker.single_agent_tracking import SingleAgentContextTracker
@@ -56,47 +55,46 @@ from ajet.task_reader import dict_to_ajet_task
 from ajet.task_rollout.native_parallel_worker import VerlRolloutManager
 from ajet.utils.metric_helper import save_trajectory_as_json_file, update_metrics
 
-def parse_reward_from_dataproto(data: DataProto, return_dict=False) -> dict | torch.Tensor:
+def parse_reward_from_dataproto(data: DataProto) -> torch.Tensor:
     """
-    Compute reward for a batch of data.
-    Args:
-        data: DataProto object containing the input data.
-        return_dict: Whether to return a dictionary or just the reward tensor.
-
-    Returns:
-        Tensor of shape (bs, response_len) if return_dict is False,
-        or a dict with 'reward_tensor' and 'reward_extra_info'.
+    Reward scalar -> token-level reward tensor conversion.
     """
-    # Within DataFlow, world.execute() will pass a float score, which will be contained in the DataProto.non_tensor_batch('reward_scores')
-
-    # Initialize reward tensor
     reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)  # (bs, reslen)
-    reward_extra_info = defaultdict(list)
 
-    # Batch-level processing
-    prompt_ids_batch = data.batch["prompts"]  # (bs, prompt_len)
-    prompt_lengths = prompt_ids_batch.shape[-1]
+    def get_response_lengths():
+        # Batch-level processing
+        prompt_ids_batch = data.batch["prompts"]  # (bs, prompt_len)
+        prompt_lengths = prompt_ids_batch.shape[-1]
+        # Get attention masks for all items
+        attention_masks = data.batch["attention_mask"]  # (bs, total_len)
+        response_lengths = attention_masks[:, prompt_lengths:].sum(dim=1)  # (bs, )
+        return response_lengths
 
-    # Get attention masks for all items
-    attention_masks = data.batch["attention_mask"]  # (bs, total_len)
-    response_lengths = attention_masks[:, prompt_lengths:].sum(dim=1)  # (bs, )
-
-    # Get reward scores
-    reward_scores_list = [item for item in data.non_tensor_batch["reward_scores"]]
+    # Get scalar reward scores
     reward_scores = torch.tensor(
-        reward_scores_list, device=reward_tensor.device, dtype=torch.float32
+        [item for item in data.non_tensor_batch["reward_scores"]],
+        device=reward_tensor.device, dtype=torch.float32
     )  # (bs, )
 
     # Use advanced indexing to assign rewards (placing reward at the last token position)
-    reward_tensor[torch.arange(len(data)), response_lengths - 1] = reward_scores
+    # e.g.
+    # reward_scores = [1,2,3]
+    # response_lengths = [7,3,4]
+    # reward_tensor = [
+    #     [0,0,0,0,0,0,1,0,0],
+    #     [0,0,2,0,0,0,0,0,0],
+    #     [0,0,0,3,0,0,0,0,0],
+    # ]
+    response_lengths = get_response_lengths()
+    assert len(data) == reward_tensor.shape[0]
+    reward_tensor[torch.arange(reward_tensor.shape[0]), response_lengths - 1] = reward_scores
 
-    if return_dict:
-        return {
-            "reward_tensor": reward_tensor,
-            "reward_extra_info": reward_extra_info,
-        }
-    else:
-        return reward_tensor
+    return reward_tensor
+
+
+def compute_reward(data: DataProto) -> tuple[torch.Tensor, dict[str, Any]]:
+    reward_tensor = parse_reward_from_dataproto(data)
+    return reward_tensor, {}
 
 
 def union_gen_batch_via_task_id(tasks, batch: DataProto, gen_batch_output: DataProto, discard_original_batch=False):
@@ -118,10 +116,159 @@ def union_gen_batch_via_task_id(tasks, batch: DataProto, gen_batch_output: DataP
                 task_id_counter[tid] += 1
             else:
                 task_id_counter[tid] = 1
-            current_id = task_id_counter[tid]
-            gen_batch_output.non_tensor_batch['rollout_ids'][i] = f"T{tid}R{current_id}"
         logger.info(f'task_id_counter: {task_id_counter}')
         return gen_batch_output
+
+def import_or_export_data_proto(batch: DataProto, direction: str = "export", file: str = "./tmp.pkl") -> DataProto:
+    """Import or export a DataProto batch to/from a pickle file.
+
+    Args:
+        batch: The DataProto batch object. Used when direction is "export";
+               ignored (can be None) when direction is "import".
+        direction: "import" to load a batch from file, "export" to save the batch to file.
+        file: Path to the pickle file. Defaults to "./tmp.pkl".
+
+    Returns:
+        The DataProto batch — either the one just loaded (import) or the one just saved (export).
+
+    Raises:
+        ValueError: If direction is not "import" or "export".
+        FileNotFoundError: If direction is "import" and the file does not exist.
+    """
+    import pickle
+    if direction == "export":
+        with open(file, "wb") as f:
+            pickle.dump(batch, f)
+        logger.info(f"[import_or_export_data_proto] Exported batch to {file}")
+        return batch
+    elif direction == "import":
+        with open(file, "rb") as f:
+            batch = pickle.load(f)
+        logger.info(f"[import_or_export_data_proto] Imported batch from {file}")
+        return batch
+    else:
+        raise ValueError(f"direction must be 'import' or 'export', got '{direction}'")
+
+def compute_grpo_episode_level_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    episode_index: np.ndarray,
+    norm_adv_by_std_in_grpo: bool = True,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GRPO outcome advantage with the baseline computed at *episode* scope.
+
+    Mirrors ``verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage`` but,
+    instead of treating every sample equally when forming the per-task (``uid``)
+    baseline, it first reduces every episode (``episode_uuids``) to its mean
+    scalar reward and then computes the task baseline mean/std over those
+    per-episode means. This way an episode that produced many samples does not
+    dominate the baseline of an episode that produced few.
+
+    Example (matches the documented behaviour):
+        task T -> episode 1 (2 samples, reward 1) + episode 2 (1 sample, reward 0)
+        sample scope baseline  = (1 + 1 + 0) / 3 = 0.667
+        episode scope baseline = (mean[1, 1] + mean[0]) / 2 = (1 + 0) / 2 = 0.5
+
+    Args:
+        token_level_rewards: (bsz, response_length) reward tensor.
+        response_mask: (bsz, response_length) mask of trainable response tokens.
+        index: per-sample task id (``non_tensor_batch["uid"]``).
+        episode_index: per-sample episode id (``non_tensor_batch["episode_uuids"]``).
+        norm_adv_by_std_in_grpo: divide the centred reward by the (episode-level)
+            group std when True, otherwise only subtract the group mean.
+        epsilon: numerical-stability term added to the std denominator.
+
+    Returns:
+        (advantages, returns) - both (bsz, response_length); identical, as in GRPO.
+    """
+    scores = token_level_rewards.sum(dim=-1)    #  (bs, response_length)
+    bsz = scores.shape[0]
+
+    with torch.no_grad():
+        # 1) reduce each episode to its mean scalar reward
+        episode_score_sum: dict = defaultdict(float)
+        episode_score_cnt: dict = defaultdict(int)
+        for i in range(bsz):
+            ep = episode_index[i]
+            episode_score_sum[ep] += scores[i].item()
+            episode_score_cnt[ep] += 1
+        episode_mean = {ep: episode_score_sum[ep] / episode_score_cnt[ep] for ep in episode_score_sum}
+
+        # 2) collect, per task, the set of distinct episodes it produced
+        task2episodes: dict = defaultdict(dict)  # use dict as ordered set
+        for i in range(bsz):
+            task2episodes[index[i]][episode_index[i]] = None
+
+        # 3) per-task baseline = mean/std over the per-episode means.
+        #    Single-episode tasks are degenerate -> follow verl's convention
+        #    (mean=0, std=1) so the advantage reduces to the raw score.
+        task_mean: dict = {}
+        task_std: dict = {}
+        for task, episodes in task2episodes.items():
+            vals = torch.tensor([episode_mean[ep] for ep in episodes], dtype=torch.float32)
+            if vals.numel() == 1:
+                task_mean[task] = torch.tensor(0.0)
+                task_std[task] = torch.tensor(1.0)
+            else:
+                task_mean[task] = vals.mean()
+                task_std[task] = vals.std()
+
+        # 4) centre (and optionally normalise) every sample against its task baseline
+        adv = scores.clone()
+        for i in range(bsz):
+            task = index[i]
+            if norm_adv_by_std_in_grpo:
+                adv[i] = (scores[i] - task_mean[task]) / (task_std[task] + epsilon)
+            else:
+                adv[i] = scores[i] - task_mean[task]
+
+        adv = adv.unsqueeze(-1) * response_mask
+    return adv, adv
+
+
+def compute_episode_level_loss_weight(data: DataProto) -> torch.Tensor:
+    """Per-token loss weight that makes every episode contribute equally.
+
+    Each sample belonging to an episode (same ``non_tensor_batch["episode_uuids"]``)
+    that produced ``N`` samples receives weight ``1 / N``. The weights of all
+    samples of one episode therefore sum to 1, so an episode that emitted many
+    samples does not contribute more to the loss than one that emitted few.
+
+    The weight is broadcast across the response dimension so it has the **same
+    shape as ``advantages``** ((bsz, response_length)); this lets it multiply
+    both the per-token policy-gradient term and the per-token KL term directly.
+
+    Returns:
+        A (bsz, response_length) tensor (matching ``data.batch["advantages"]``
+        dtype/device) of per-token loss weights, constant along the response
+        dimension for a given sample.
+    """
+    episode_index = data.non_tensor_batch["episode_uuids"]
+    bsz = len(episode_index)
+    episode_count: dict = defaultdict(int)
+    for ep in episode_index:
+        episode_count[ep] += 1
+    advantages = data.batch["advantages"]  # (bsz, response_length)
+    per_sample = torch.tensor(
+        [1.0 / episode_count[episode_index[i]] for i in range(bsz)],
+        dtype=advantages.dtype,
+        device=advantages.device,
+    )
+
+    # per_sample = tensor([1.0000, 0.3333, 0.3333, 0.3333, 0.5000, 0.5000])
+    # broadcast per-sample weight to the same shape as advantages
+    weights = per_sample.view(-1, 1) * torch.ones_like(advantages)
+
+    # expected loss_weight:
+    # tensor([[1.0000, 1.0000, 1.0000, 1.0000],
+    #         [0.3333, 0.3333, 0.3333, 0.3333],
+    #         [0.3333, 0.3333, 0.3333, 0.3333],
+    #         [0.3333, 0.3333, 0.3333, 0.3333],
+    #         [0.5000, 0.5000, 0.5000, 0.5000],
+    #         [0.5000, 0.5000, 0.5000, 0.5000]])
+    return weights
 
 
 def compute_advantage(
@@ -132,6 +279,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    advantage_estimation_episode_level: bool = False,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -147,6 +295,9 @@ def compute_advantage(
         norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
             GRPO. Defaults to True.
         config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
+        advantage_estimation_episode_level (bool, optional): When True (and using the GRPO estimator),
+            the GRPO baseline is computed at episode scope instead of sample scope so every episode
+            contributes equally regardless of how many samples it produced. Defaults to False.
 
     Returns:
         DataProto: The updated data with computed advantages and returns.
@@ -154,6 +305,11 @@ def compute_advantage(
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
+    if advantage_estimation_episode_level and adv_estimator != AdvantageEstimator.GRPO:
+        raise NotImplementedError(
+            "ajet.trainer_common.advantage_estimation_episode_level is only "
+            f"supported with the GRPO advantage estimator, got {adv_estimator}."
+        )
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -180,13 +336,30 @@ def compute_advantage(
         response_length = grpo_calculation_mask.size(1)
         # This mask is the one intended for GRPO
         grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )
+        if advantage_estimation_episode_level:
+            # Episode-scope baseline: every episode contributes equally to the
+            # per-task baseline regardless of how many samples it produced.
+            if "episode_uuids" not in data.non_tensor_batch:
+                raise KeyError(
+                    "advantage_estimation_episode_level is enabled but "
+                    "non_tensor_batch['episode_uuids'] is missing; cannot identify "
+                    "same-episode samples."
+                )
+            advantages, returns = compute_grpo_episode_level_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=data.non_tensor_batch["uid"],
+                episode_index=data.non_tensor_batch["episode_uuids"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+        else:
+            # Call compute_grpo_outcome_advantage with parameters matching its definition
+            advantages, returns = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=data.non_tensor_batch["uid"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
@@ -297,13 +470,6 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                 "actor_rollout_ref.rollout",
             )
 
-        # Check for reward model micro-batch size conflicts
-        if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
-            check_mutually_exclusive(
-                config.reward_model.micro_batch_size,
-                config.reward_model.micro_batch_size_per_gpu,
-                "reward_model",
-            )
 
         if self.config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
             logger.warning("NOTICE: You have both enabled in-reward kl and kl loss.")
@@ -329,129 +495,24 @@ class AjetRayPPOTrainer(RayPPOTrainer):
         logger.success("[validate_config] All configuration checks passed successfully!")
 
     def init_workers(self):
-        """Initialize distributed training workers using Ray backend.
-
-        Creates:
-        1. Ray resource pools from configuration
-        2. Worker groups for each role (actor, critic, etc.)
-        """
-        self.resource_pool_manager.create_resource_pool()
-
-        self.resource_pool_to_cls = {
-            pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()
-        }
-
-        # create actor and rollout
-        if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role="actor_rollout",
-                profile_option=self.config.trainer.npu_profile.options,
-            )
-            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
-        else:
-            raise NotImplementedError
-
-        # create critic
-        if self.use_critic:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cfg = omega_conf_to_dataclass(self.config.critic)
-            critic_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.Critic], config=critic_cfg
-            )
-            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
-
-        # create reference policy if needed
-        if self.use_reference_policy:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-            ref_policy_cls = RayClassWithInitArgs(
-                self.role_worker_mapping[Role.RefPolicy],
-                config=self.config.actor_rollout_ref,
-                role="ref",
-                profile_option=self.config.trainer.npu_profile.options,
-            )
-            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
-
-        # create a reward model if reward_fn is None
-        if self.use_rm:
-            # we create a RM here
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            rm_cls = RayClassWithInitArgs(
-                self.role_worker_mapping[Role.RewardModel],
-                config=self.config.reward_model,
-            )
-            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
-
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        all_wg = {}
-        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
-        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
-            wg_kwargs[
-                "ray_wait_register_center_timeout"
-            ] = self.config.trainer.ray_wait_register_center_timeout
-        if OmegaConf.select(self.config.trainer, "profile_steps") is not None:
-            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.trainer, "profile_steps")
-            assert (
-                OmegaConf.select(self.config.trainer, "worker_nsight_options") is not None
-            ), "worker_nsight_options must be set when profile_steps is set"
-            wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
-                OmegaConf.select(self.config.trainer, "worker_nsight_options")
-            )
-        wg_kwargs["device_name"] = self.device_name
-
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(
-                resource_pool=resource_pool,
-                ray_cls_with_init=worker_dict_cls,
-                **wg_kwargs,
-            )
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-            all_wg.update(spawn_wg)
-
-        if self.use_critic:
-            self.critic_wg = all_wg["critic"]
-            self.critic_wg.init_model()
-
-        if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg["ref"]
-            self.ref_policy_wg.init_model()
-
-        if self.use_rm:
-            self.rm_wg = all_wg["rm"]
-            self.rm_wg.init_model()
-
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg["actor_rollout"]
-        self.actor_rollout_wg.init_model()
-
-        # create async rollout manager and request scheduler
-        self.async_rollout_mode = False
-        from verl.experimental.agent_loop.agent_loop import (
-            AgentLoopManager,
-            AsyncLLMServerManager,
-        )
-
-        self.async_rollout_mode = True
-        agent_loop_manager = AgentLoopManager(
-            config=self.config,
-            worker_group=self.actor_rollout_wg,
-        )
-        self.async_server_list = agent_loop_manager.async_llm_servers
-        self.async_rollout_manager = AsyncLLMServerManager(self.config, self.async_server_list)
+        super().init_workers()
 
         self.reward_fn = parse_reward_from_dataproto
         self.val_reward_fn = parse_reward_from_dataproto
 
+        assert hasattr(self.async_rollout_manager, "agent_loop_workers")
+        assert len(self.async_rollout_manager.agent_loop_workers) == 1, "Please set `num_workers = 1` in `ajet/default_config/verl/verl_default.yaml`"
+
+        servers = list(zip(self.async_rollout_manager.server_addresses, self.async_rollout_manager.server_handles, strict=True))
+        real_async_rollout_manager: AsyncLLMServerManager  = AsyncLLMServerManager(
+            config = self.async_rollout_manager.config,
+            servers = servers,
+            load_balancer_handle = self.async_rollout_manager.global_load_balancer
+        )
+
         self.parallel_env = VerlRolloutManager(
             config=self.config,
-            async_rollout_manager=self.async_rollout_manager,
+            async_rollout_manager=real_async_rollout_manager,
             max_parallel=self.config.ajet.rollout.max_env_worker,
             tokenizer=self.tokenizer,
         )
@@ -462,20 +523,21 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                 from ajet.tuner_lib.experimental.interchange_utils import http_change_engine_status
                 http_change_engine_status(self.config, status, global_step=self.global_steps)
 
+    @auto_await
+    async def _sleep_rollout_replicas(self):
+        await asyncio.gather(*[replica.abort_all_requests() for replica in self.checkpoint_manager.replicas])
+        await self.checkpoint_manager.sleep_replicas()
+
     # #######################################
     # training loop
     # #######################################
     def fit(self):  # noqa: C901
-        """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC
-        to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
-        """
+
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
 
         warm_up_process(self.config)
+
         self.verl_logger = Tracking(
             project_name=self.config.ajet.project_name,
             experiment_name=self.config.ajet.experiment_name,
@@ -486,19 +548,26 @@ class AjetRayPPOTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)
+        self._sleep_rollout_replicas()
 
-        # wake and sleep to enforce param sync
-        self.async_rollout_manager.wake_up()
-        self.async_rollout_manager.sleep()
+        # [oc] swarm_mode is not compatible with `val_before_train` and `val_only`
+        assert not (self.config.ajet.enable_swarm_mode and (self.config.ajet.trainer_common.val_before_train or self.config.ajet.trainer_common.val_only)), \
+            "swarm_mode is not compatible with `val_before_train` and `val_only`"
+
 
         # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if (self.val_reward_fn is not None) and (self.config.trainer.get("val_before_train", True)) and (not self.config.ajet.enable_swarm_mode):
+        if (self.config.ajet.trainer_common.val_before_train) and (not self.config.ajet.enable_swarm_mode):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
             self.verl_logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
+            val_print_to_markdown_file_path = self.config.ajet.trainer_common.val_print_to_markdown_file_path
+            if val_print_to_markdown_file_path:
+                os.makedirs(os.path.dirname(val_print_to_markdown_file_path), exist_ok=True)
+                with open(val_print_to_markdown_file_path, mode="a+") as f:
+                    f.write(str(val_metrics))
+                    f.write('\n')
+            if self.config.ajet.trainer_common.val_only:
                 return
 
         # add tqdm
@@ -513,25 +582,11 @@ class AjetRayPPOTrainer(RayPPOTrainer):
         last_val_metrics = None
         self.max_steps_duration = 0
 
-        prev_step_profile = False
-        curr_step_profile = (
-            self.global_steps in self.config.trainer.profile_steps
-            if self.config.trainer.profile_steps is not None
-            else False
-        )
-        next_step_profile = False
-
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
 
-                with marked_timer("start_profile", timing_raw):
-                    self._start_profiling(
-                        not prev_step_profile and curr_step_profile
-                        if self.config.trainer.profile_continuous_steps
-                        else curr_step_profile
-                    )
 
                 batch_dict["index"] = torch.tensor(
                     [i for i in range(len(batch_dict["task_id"]))],
@@ -568,9 +623,9 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                     # generate a batch
                     logger.info("rollout step begin")
                     with marked_timer("gen", timing_raw, color="red"):
-                        assert self.async_rollout_mode
+                        # assert self.async_rollout_mode
                         logger.info("wake up begin")
-                        self.async_rollout_manager.wake_up()
+                        self.checkpoint_manager.update_weights(self.global_steps)
                         self._update_interchange_server_status_flag("ENGINE.ROLLING")
                         logger.info("wake up end")
                         tasks: List[Task] = [
@@ -591,15 +646,16 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                                 ]
                             )
                         )
-                        logger.info("start fit rollout")
+                        logger.info("start batch rollout")
                         self.parallel_env.current_global_steps = self.global_steps
+                        # rollout stage begin ✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨
                         context_tracker_arr: List[SingleAgentContextTracker] = self.parallel_env.rollout(
                             tasks, mode="sample", epoch=f"train.{epoch}"
                         )
 
                         # from ajet import bp; bp("BATCH")
 
-                        logger.info("end fit rollout")
+                        logger.info("end batch rollout")
                         gen_batch_output = self.parallel_env.to_dataproto(context_tracker_arr)
                         logger.info("end dataproto convertion")
 
@@ -629,9 +685,7 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                         if self.config.ajet.execute_test:  # apply a test probe
                             from swanlab.data.run.main import get_run
 
-                            from ajet.utils.testing_utils import (
-                                _test_if_test_mode,
-                            )
+                            from ajet.utils.testing_utils import _test_if_test_mode
 
                             run_info = get_run().public.json()  # type: ignore
                             data = {
@@ -645,9 +699,8 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                             f"gen_batch_output.info batch.keys={gen_batch_output.batch.keys()}"
                         )
                         self._update_interchange_server_status_flag("ENGINE.WEIGHT_SYNCING")
-                        self.async_rollout_manager.sleep()
+                        self._sleep_rollout_replicas()
                     logger.info("rollout step end")
-
 
                     batch.non_tensor_batch["uid"] = np.array(
                         [str(uuid.uuid4()) for _ in range(len(batch.batch))],
@@ -668,50 +721,59 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(
-                        batch.batch["attention_mask"], dim=-1
-                    ).tolist()
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        if self.config.reward_model.launch_reward_fn_async:
-                            raise NotImplementedError(
-                                "launch_reward_fn_async is not supported in GRPO yet."
-                            )
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(
-                                batch, self.reward_fn
-                            )
+                        reward_tensor = parse_reward_from_dataproto(batch)
 
                     # recompute old_log_probs
-                    logger.info("+ compute log_probs begin")
-                    with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(
-                            loss_mat=entropys,
-                            loss_mask=response_masks,
-                            loss_agg_mode=loss_agg_mode,
+                    # Operating Mode Selection:
+                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+                        apply_bypass_mode(
+                            batch=batch,
+                            rollout_corr_config=rollout_corr_config,
+                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
-                        assert not torch.isnan(
-                            entropy_loss
-                        ).item(), "Entropy loss should not be NaN, something must have gone terribly wrong."
-                        old_log_prob_metrics = {"actor/entropy": entropy_loss.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                    else:  # Recompute old_log_probs
+                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            actor_config = self.config.actor_rollout_ref.actor
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=actor_config.loss_agg_mode,
+                                loss_scale_factor=actor_config.loss_scale_factor,
+                            )
+                            old_log_prob_metrics = {
+                                "actor/entropy": entropy_agg.detach().item(),
+                                "perf/mfu/actor_infer": old_log_prob_mfu,
+                            }
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+                                raise ValueError(
+                                    "Detected conflicting router replay configuration: "
+                                    "router_replay.mode='R2' and enable_rollout_routing_replay=True "
+                                    "cannot be enabled simultaneously. "
+                                    "The enable_rollout_routing_replay option is only used in R3 mode; "
+                                    "it should not be set when using R2 mode."
+                                )
+                            batch = batch.union(old_log_prob)
+                            if "rollout_log_probs" in batch.batch.keys():
+                                # TODO: we may want to add diff of probs too.
+                                from verl.utils.debug.metrics import calculate_debug_metrics
 
-                        if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            from verl.utils.debug.metrics import calculate_debug_metrics
+                                metrics.update(calculate_debug_metrics(batch))
 
-                            metrics.update(calculate_debug_metrics(batch))
+                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -730,30 +792,44 @@ class AjetRayPPOTrainer(RayPPOTrainer):
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
 
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update(
-                                {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
-                            )
-
+                        from ajet import bp; bp("KL")
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
-                                batch,
-                                kl_ctrl=self.kl_ctrl_in_reward,
-                                kl_penalty=self.config.algorithm.kl_penalty,
+                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty,
                             )
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # compute advantages, executed on the driver process
+                        # Compute rollout correction: IS weights, rejection sampling, and metrics
+                        # Only runs in decoupled mode (computes once per batch using stable π_old)
+                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        if (
+                            rollout_corr_config is not None
+                            and "rollout_log_probs" in batch.batch
+                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+                        ):
+                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 
+                            # Compute IS weights, apply rejection sampling, compute metrics
+                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                            # IS and off-policy metrics already have rollout_corr/ prefix
+                            metrics.update(is_metrics)
+
+                        # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
+
+                        # [AJET] episode-scope advantage baseline (disabled by default)
+                        advantage_estimation_episode_level = bool(
+                            self.config.ajet.trainer_common.get(
+                                "advantage_estimation_episode_level", False
+                            )
+                        )
 
                         batch = compute_advantage(
                             batch,
@@ -763,7 +839,17 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                             num_repeat=self.config.ajet.rollout.num_repeat,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
+                            advantage_estimation_episode_level=advantage_estimation_episode_level,
                         )
+
+                        # [AJET] per-sample loss weight that makes every episode
+                        # contribute equally to the policy-gradient update
+                        # (disabled by default). Consumed in
+                        # AjetDataParallelPPOActor.update_policy.
+                        if bool(self.config.ajet.trainer_common.get("loss_weight_normalization_episode_level", False)):
+                            if "episode_uuids" not in batch.non_tensor_batch:
+                                raise KeyError("loss_weight_normalization_episode_level is enabled but non_tensor_batch['episode_uuids'] is missing; cannot identify same-episode samples.")
+                            batch.batch["loss_weight"] = compute_episode_level_loss_weight(batch)
 
                     # update critic
                     if self.use_critic:
@@ -774,17 +860,15 @@ class AjetRayPPOTrainer(RayPPOTrainer):
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                        # update actor ✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨✨
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = True
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output = self._update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
                     # validate
                     if (
-                        self.val_reward_fn is not None
-                        and self.config.trainer.test_freq > 0
+                        self.config.trainer.test_freq > 0
                         and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                         and (not self.config.ajet.enable_swarm_mode)
                     ):
@@ -793,6 +877,12 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                             if is_last_step:
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
+                        val_print_to_markdown_file_path = self.config.ajet.trainer_common.val_print_to_markdown_file_path
+                        if val_print_to_markdown_file_path:
+                            os.makedirs(os.path.dirname(val_print_to_markdown_file_path), exist_ok=True)
+                            with open(val_print_to_markdown_file_path, mode="a+") as f:
+                                f.write(str(val_metrics))
+                                f.write('\n')
 
                     # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                     esi_close_to_expiration = should_save_ckpt_esi(
@@ -816,19 +906,6 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                         with marked_timer("save_checkpoint", timing_raw, color="green"):
                             self._save_checkpoint()
 
-                with marked_timer("stop_profile", timing_raw):
-                    next_step_profile = (
-                        self.global_steps + 1 in self.config.trainer.profile_steps
-                        if self.config.trainer.profile_steps is not None
-                        else False
-                    )
-                    self._stop_profiling(
-                        curr_step_profile and not next_step_profile
-                        if self.config.trainer.profile_continuous_steps
-                        else curr_step_profile
-                    )
-                    prev_step_profile = curr_step_profile
-                    curr_step_profile = next_step_profile
 
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
@@ -854,6 +931,12 @@ class AjetRayPPOTrainer(RayPPOTrainer):
                     self.train_dataloader.sampler.update(batch=batch)
 
                 self.verl_logger.log(data=metrics, step=self.global_steps)
+                train_print_to_markdown_file_path = self.config.ajet.trainer_common.train_print_to_markdown_file_path
+                if train_print_to_markdown_file_path:
+                    os.makedirs(os.path.dirname(train_print_to_markdown_file_path), exist_ok=True)
+                    with open(train_print_to_markdown_file_path, mode="a+") as f:
+                        f.write(str(metrics))
+                        f.write('\n')
                 progress_bar.update(1)
                 self.global_steps += 1
 
@@ -872,7 +955,6 @@ class AjetRayPPOTrainer(RayPPOTrainer):
     # #######################################
     def _validate(self):
         data_source_lst = []
-        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
         # Lists to collect samples for the table
         sample_outputs = []
@@ -887,7 +969,7 @@ class AjetRayPPOTrainer(RayPPOTrainer):
 
             # repeat test batch
             test_batch = test_batch.repeat(
-                repeat_times=self.config.ajet.rollout.val_kwargs.num_repeat,
+                repeat_times=self.config.ajet.trainer_common.val_pass_n,
                 interleave=True,
             )
 
@@ -934,11 +1016,11 @@ class AjetRayPPOTrainer(RayPPOTrainer):
             }
             logger.info(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            self.async_rollout_manager.wake_up()
-            main_val_dataset = self.get_eval_dataset()
+            self.checkpoint_manager.update_weights(self.global_steps)
+            main_val_dataset = self.get_val_dataset()
 
             logger.info("Starting validate rollout")
-            context_tracker_arr, tasks, val_metrics = self.eval_dataset(
+            context_tracker_arr, tasks, val_metrics = self._rollout_val_dataset(
                 target_dataset=main_val_dataset,
                 target_dataset_name="main_val_dataset",
                 mode="validate",
@@ -946,7 +1028,7 @@ class AjetRayPPOTrainer(RayPPOTrainer):
             )
             logger.info("Completed validate rollout")
             test_output_gen_batch = self.parallel_env.to_dataproto(context_tracker_arr)
-            self.async_rollout_manager.sleep()
+            self._sleep_rollout_replicas()
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
@@ -965,24 +1047,9 @@ class AjetRayPPOTrainer(RayPPOTrainer):
             # test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
-            # evaluate using reward_function
-            if self.val_reward_fn is None:
-                raise ValueError("val_reward_fn must be provided for validation.")
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
+            reward_tensor = parse_reward_from_dataproto(test_batch)
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
-
-            reward_extra_infos_dict["reward"].extend(scores)
-            logger.info(
-                f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}"
-            )
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
-                    logger.info(
-                        f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}"
-                    )
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -997,7 +1064,7 @@ class AjetRayPPOTrainer(RayPPOTrainer):
 
         return metric_dict
 
-    def eval_dataset(self, target_dataset, target_dataset_name, mode, epoch):
+    def _rollout_val_dataset(self, target_dataset, target_dataset_name, mode, epoch):
         """
         Evaluate a dataset by running rollouts and computing task completion metrics.
 
@@ -1043,7 +1110,7 @@ class AjetRayPPOTrainer(RayPPOTrainer):
         for task_id, task_outcomes in task_results.items():
             # Calculate num_all_success_tasks  # The number of tasks where all were successful in n experiments
             # Calculate num_pass_n_tasks       # The number of tasks where at least one was successful in n experiments
-            assert len(task_outcomes["tag_arr"]) == pass_n
+            assert len(task_outcomes["tag_arr"]) == pass_n, f"expect {pass_n} attempts, but got {len(task_outcomes['tag_arr'])} attempts for task_id={task_id}."
             if all(tag == "success" for tag in task_outcomes["tag_arr"]):
                 num_all_success_tasks += 1
             if any(tag == "success" for tag in task_outcomes["tag_arr"]):
@@ -1059,16 +1126,25 @@ class AjetRayPPOTrainer(RayPPOTrainer):
         assert num_tasks == len(ctx_trackers) // pass_n
 
         val_metrics = {
-            "target dataset name": target_dataset_name,
+            "global_steps": self.global_steps,
             "pass_n": pass_n,
             "total_tasks": len(task_results),
             "num_all_success_tasks": num_all_success_tasks,
             f"num_pass_n_tasks(pass@{pass_n})": num_pass_n_tasks,
-            "TGC@1": repeated_success_tasks / (num_tasks * pass_n),
-            f"TGC@{pass_n}": num_pass_n_tasks / num_tasks,
-            f"TGC@{pass_n}-all-pass": num_all_success_tasks / num_tasks,
+            "task_pass_rate@1": repeated_success_tasks / (num_tasks * pass_n),
+            f"task_pass_rate@{pass_n}": num_pass_n_tasks / num_tasks,
+            f"task_pass_rate@{pass_n}-all-pass": num_all_success_tasks / num_tasks,
             "mean_reward": sum(rewards) / len(rewards) if rewards else 0,
+            "std_reward": np.std(rewards) if rewards else 0,
         }
+        for k in [2, 4, 8, 16]:
+            if pass_n > k:
+                num_pass_k = 0
+                for task_id, task_outcomes in task_results.items():
+                    if any(tag == "success" for tag in task_outcomes["tag_arr"][:k]):
+                        num_pass_k += 1
+                val_metrics[f"task_pass_rate@{k}"] = num_pass_k / num_tasks
+
         save_trajectory_as_json_file(ctx_trackers, self.global_steps, self.config, prefix="eval")
         update_metrics(ctx_trackers, val_metrics, prefix="eval_")
         print_dict(
@@ -1079,10 +1155,11 @@ class AjetRayPPOTrainer(RayPPOTrainer):
         )
 
         self.verl_logger.log(data=val_metrics, step=self.global_steps)
+        val_metrics.update({"target_dataset_name": target_dataset_name})
 
         return ctx_trackers, tasks, val_metrics
 
-    def get_eval_dataset(self):
+    def get_val_dataset(self):
         from ajet.task_reader import RouterTaskReader
 
         task_reader = RouterTaskReader(
@@ -1090,5 +1167,24 @@ class AjetRayPPOTrainer(RayPPOTrainer):
             self.config.ajet.task_reader,
         )
         tasks = task_reader.get_validation_tasks()
+
+        # clip validation tasks if val_max_num_task_each_validation is set
+        val_max_num_task = self.config.ajet.trainer_common.val_max_num_task_each_validation
+        if val_max_num_task is not None and len(tasks) > val_max_num_task:
+            original_size = len(tasks)
+            clip_method = self.config.ajet.trainer_common.val_max_num_task_clip_method
+            if clip_method == "fix_seed_random_n":
+                rng = np.random.RandomState(seed=42)
+                indices = rng.choice(len(tasks), val_max_num_task, replace=False)
+                tasks = [tasks[i] for i in sorted(indices)]
+            elif clip_method == "random_n":
+                indices = np.random.choice(len(tasks), val_max_num_task, replace=False)
+                tasks = [tasks[i] for i in sorted(indices)]
+            elif clip_method == "first_n":
+                tasks = tasks[:val_max_num_task]
+            else:
+                raise ValueError(f"Unknown val_max_num_task_clip_method: {clip_method}, expected 'fix_seed_random_n', 'random_n', or 'first_n'")
+            logger.info(f"Clipped validation dataset from {original_size} to {val_max_num_task} tasks using '{clip_method}'")
+
         self.main_val_dataset = tasks
         return self.main_val_dataset

@@ -18,6 +18,12 @@
 
 ## ✈️ News
 
+- 2026.6.4 Arxiv paper release: *AgentJet - A Flexible Swarm Training Framework for Agentic Reinforcement Learning* [2606.04484](https://arxiv.org/abs/2606.04484).
+- 2026.5.26 From Laptop to GPU Cluster: `sync_train_code` enables remote-controlled Swarm Training and closes the loop for automated RL research. [EN Blog](https://modelscope.github.io/AgentJet/en/blog_sync_train_code/) / [ZH Blog](https://modelscope.github.io/AgentJet/en/blog_sync_train_code.zh/).
+- 2026.4.30 DeepFinance: training a financial deep-research Agent with multi-dimensional reward GRPO. [EN Blog](https://modelscope.github.io/AgentJet/en/example_deep_finance/) / [ZH Blog](https://modelscope.github.io/AgentJet/en/example_deep_finance.zh/).
+- 2026.4.9 AgentJet-powered Auto Research: fully automated overnight RL experiments. [EN Blog](https://modelscope.github.io/AgentJet/en/blog_auto_research.en/) / [ZH Blog](https://modelscope.github.io/AgentJet/en/blog_auto_research/).
+- 2026.3.30 LoRA training example is now online! See [tutorial/example_math_lora](tutorial/example_math_lora/) for an example.
+- 2026.3.26 Upgrade verl backend to 0.7.1 to support more models and increase training speed! All [benchmark](https://benchmark.agentjet.top/) verified.
 - 2026.3.19 Support for latest Qwen3.5 models is [in progress](https://github.com/modelscope/AgentJet/pull/16).
 - 2026.3.12 Tuning Original OpenClaw Agent without Editing Any Agent Code. [EN Blog](https://modelscope.github.io/AgentJet/en/example_openclaw/) / [ZH Blog](https://modelscope.github.io/AgentJet/en/example_openclaw.zh/).
 - 2026.3.09 Non-shared-parameter Multiagent Training. [EN Blog](https://modelscope.github.io/AgentJet/en/example_train_multi_model/) / [ZH Blog](http://modelscope.github.io/AgentJet/en/example_train_multi_model.zh/).
@@ -26,7 +32,7 @@
 
 ## ✈️ Fast Introduction
 
-### Classic Mode
+### **1 - Classic Mode**
 
 Let's begin with the simplest example: a math agent with a tool call. This is a simple & centralized training example.
 
@@ -35,19 +41,34 @@ Let's begin with the simplest example: a math agent with a tool call. This is a 
     ```python
     ajet --conf ./tutorial/example_math_agent/math_agent.yaml --backbone='verl'
     ```
+
 <div align="center">
-<img width="640" alt="image" src="https://serve.gptacademic.cn/publish/shared/Image/classic+swarm+revise.jpg"/>
+<img width="600" alt="image" src="https://serve.gptacademic.cn/publish/shared/Image/new_classic.png"/>
 </div>
 
-### Swarm Mode
+### **2 - Swarm Mode**
 
 Let's begin with the simplest AgentJet Swarm example: also a math agent. In this case, you can use any GPU-less laptop to train the model remotely.
 
-1. Start swarm server and begin swarm overwatch: `ajet-swarm start` and `ajet-swarm overwatch`. (Alternative: if you are a fan of docker, use our [prebuilt docker image here](docs/en/ajet-swarm-docker.md) without setting up dependencies)
+1. Start swarm server and begin swarm overwatch: `ajet-swarm start` and `ajet-swarm overwatch` (or `ajet-swarm top`). (Alternative: if you are a fan of docker, use our [prebuilt docker image here](docs/en/ajet-swarm-docker.md) without setting up dependencies)
 2. From your laptop (or swarm server localhost), run [this simple script](https://github.com/modelscope/AgentJet/blob/main/tutorial/example_math_swarm/math.py) to begin training:
     ```python
     AJET_SWARM_URL="http://swarm-server-ip:10086" python ./tutorial/example_math_swarm/math.py
     ```
+
+
+<!-- <div align="center">
+<img width="600" alt="image" src="https://serve.gptacademic.cn/publish/shared/Image/new_swarm.png"/>
+</div> -->
+
+<!-- <div align="center">
+<img width="600" alt="image" src="https://serve.gptacademic.cn/publish/shared/Image/swarming.gif"/>
+</div> -->
+
+<div align="center">
+<img width="600" alt="image" src="https://serve.gptacademic.cn/publish/shared/Image/swarming2.gif"/>
+</div>
+
 <div align="center">
 <img width="600" alt="image" src="https://github.com/user-attachments/assets/41ed1e71-8b18-4c4c-b5e2-833399317337"/>
 </div>
@@ -151,7 +172,7 @@ When swarm training mode is enabled, an additional component will be activated:
 
 ### ✈️ Navigation
 
-* **Tutorials**: From [Installation](https://modelscope.github.io/AgentJet/en/installation) to [Tuning your first agent](https://modelscope.github.io/AgentJet/en/tune_your_first_agent) — the essential path for beginners.
+* **Tutorials**: From [Installation](https://modelscope.github.io/AgentJet/en/installation) to [Tuning your first agent](https://modelscope.github.io/AgentJet/en/tune_your_first_agent) to [Multi-Node Training](https://modelscope.github.io/AgentJet/en/multi_node_training) — the essential path for beginners.
 * **Core Components**: Define your [Trainable Workflow](https://modelscope.github.io/AgentJet/en/workflow) and manage [Data](https://modelscope.github.io/AgentJet/en/data_pipeline) and [Reward](https://modelscope.github.io/AgentJet/en/task_judger).
 * **Example**: Check the [Example Library](https://modelscope.github.io/AgentJet/#example-library) above for real-world cases like [Math](https://modelscope.github.io/AgentJet/en/example_math_agent), [Werewolves game](https://modelscope.github.io/AgentJet/en/example_werewolves) and  [Learning to ask task](https://modelscope.github.io/AgentJet/en/example_learning_to_ask).
 * **Deep Dive**: Master advanced [Configuration](https://modelscope.github.io/AgentJet/en/configuration).
@@ -162,7 +183,6 @@ AgentJet is a constantly evolving project. We are planning to add the following 
 
 | Category | Feature | Status |
 | :--- | :--- | :--- |
-| **Examples** | Add LoRA training examples | Todo |
 | **Infra** | Optimize configurations for long-context adaptation on smaller GPUs | In Progress |
 | **Capability** | Multi-modal training support | Todo |
 | **Capability** | MARL Credit assignment | Todo |
@@ -197,7 +217,16 @@ This project is under active development, we need your help to make it shine! <b
 
 
 <div align="center">
-<img width="180" alt="image" src="https://img.alicdn.com/imgextra/i4/O1CN01DJuOtZ1Kgu1UvjaNl_!!6000000001194-2-tps-922-882.png"/>
+<img height="180" alt="image" src="https://img.alicdn.com/imgextra/i4/O1CN01DJuOtZ1Kgu1UvjaNl_!!6000000001194-2-tps-922-882.png"/>
 <br/>
 <span>Join AgentJet DingTalk Group to share your idea</span>
+</div>
+
+<br/>
+<hr/>
+<br/>
+
+<div align="center">
+<img height="260" alt="image" src="https://serve.gptacademic.cn/publish/shared/Image/star3.png"/>
+<br/>
 </div>

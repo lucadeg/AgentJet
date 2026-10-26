@@ -8,8 +8,14 @@ from typing import TYPE_CHECKING
 from loguru import logger
 from omegaconf import DictConfig
 from pydantic import BaseModel
-from vllm.entrypoints.openai.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
-from vllm.outputs import RequestOutput as VerlVllmRequestOutput
+try:
+    from vllm.entrypoints.openai.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
+except:
+    from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser   # vllm 0.17.x moved this class elsewhere
+
+from ajet.utils.async_utils import silence_hermes_tool_parser_loggers
+silence_hermes_tool_parser_loggers()
+from verl.workers.rollout.replica import TokenOutput
 from agentscope.model import ChatResponse as AgentScopeChatResponse
 from openai.types.chat.chat_completion import ChatCompletion as OpenAIChatCompletion
 
@@ -77,6 +83,7 @@ class AsyncLlmBridge(object):
                 updated_sampling_params.update(custom_sampling_params)
 
             input_messages = copy.deepcopy(messages)
+            # the input (prompt) sequence as text
             prompt_text = ajet_apply_chat_template(
                 tokenizer=self.tokenizer,
                 conversation=input_messages,
@@ -84,20 +91,24 @@ class AsyncLlmBridge(object):
                 add_generation_prompt=True,
                 tokenize=False,
             )
+            # the input (prompt) sequence as input_ids
             prompt_token_ids = self.tokenizer(prompt_text)["input_ids"]
 
-            final_res = await self.async_rollout_manager.generate(
+            final_res: TokenOutput = await self.async_rollout_manager.generate(
                 request_id=request_id,
                 prompt_ids=prompt_token_ids,
                 sampling_params=updated_sampling_params,
             )
 
-            if self.config.ajet.rollout.name == "vllm":
-                final_res: VerlVllmRequestOutput
-                token_array = final_res.outputs[0].token_ids
-                logprob_array = final_res.outputs[0].logprobs
-            elif self.config.ajet.rollout.name == "sglang":
-                token_array = final_res
+            """response token ids"""
+            token_array = final_res.token_ids
+            logprob_array = final_res.log_probs
+            # routed_experts = final_res.routed_experts
+            # vllm_stop_reason = final_res.stop_reason
+            if "decoded_string" in final_res.extra_fields:
+                decoded_string_array = final_res.extra_fields["decoded_string"]
+            else:
+                decoded_string_array = [self.tokenizer.decode(token_x) for token_x in token_array]
 
             decoded_text = self.tokenizer.decode(token_array)  # type: ignore
 
@@ -113,7 +124,7 @@ class AsyncLlmBridge(object):
             ):
 
                 parsed_tool_calls = self.tool_parser.extract_tool_calls(decoded_text, None)  # type: ignore
-                parsed_tool_calls = parsed_tool_calls.model_dump()
+                parsed_tool_calls = parsed_tool_calls.model_dump(mode='json')
 
                 model_called = parsed_tool_calls["tools_called"]
                 if model_called:
@@ -146,20 +157,23 @@ class AsyncLlmBridge(object):
                 "completion_tokens": len(token_array), # type: ignore
                 "total_tokens": len(prompt_token_ids) + len(token_array), # type: ignore
             }
+
             return {
                 "role": "assistant",
                 "request_id": request_id,
                 "content": decoded_text,
+                "prompt_text": prompt_text,
+                "prompt_token_ids": prompt_token_ids,
                 "tool_calls": tool_calls,
                 "finish_reason": finish_reason,
                 "usage": usage,
                 "tokens": [
                     TokenAndProb(
                         token_id=token_id,
-                        logprob=logprob[token_id].logprob,    # Warning: vllm logprob does not participant training (not reliable enough), for log only.
-                        decoded_string=logprob[token_id].decoded_token,
+                        logprob=logprob,    # Warning: vllm logprob does not participant training (not reliable enough), for log only.
+                        decoded_string=decoded_string,
                     )
-                    for token_id, logprob in zip(token_array, logprob_array)  # type: ignore
+                    for token_id, logprob, decoded_string in zip(token_array, logprob_array, decoded_string_array)  # type: ignore
                 ],
             }
 
@@ -317,7 +331,7 @@ class OpenaiLlmProxyWithTracker(object):
         episode_uuid: str,
     ):
         from openai.types.chat.chat_completion import ChatCompletion
-        req_as_dict = req.model_dump()
+        req_as_dict = req.model_dump(mode='json')
 
         # infer + process with context tracker
         llm_output = await self.run_infer(

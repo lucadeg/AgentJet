@@ -54,7 +54,7 @@ def _test_if_test_mode(key, value, config):
         return
     if config.ajet.execute_test == "do_not_test":
         return
-    init_parallel_rollout_logger(config.ajet.experiment_name, config.ajet.experiment_dir)
+    init_parallel_rollout_logger(config.ajet.experiment_dir)
     test_lambda = get_test_lambda(config.ajet.execute_testing_lambda)
     if key not in test_lambda.probe_list:
         return
@@ -102,13 +102,17 @@ def send_test_result(
         "append_log": append_log or "",
         "data_dashboard_url": data_dashboard_url or "",
     }
-    resp = requests.post(
-        r"https://benchmark-report.agent-matrix.com/report_test_result",
-        json=payload,
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        resp = requests.post(
+            r"https://benchmark-report.agent-matrix.com/report_test_result",
+            json=payload,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except:
+        logger.error("Unable to report to benchmark server.")
+        return {}
 
 
 def populate_test_env_metadata(workspace_dir: str) -> tuple[str, str]:

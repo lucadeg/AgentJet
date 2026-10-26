@@ -26,14 +26,23 @@ def get_runtime_env(config, is_trinity: bool = False) -> dict:
 
     runtime_env = {
         "env_vars": {
-            "VLLM_USE_V1": "1",
             "NCCL_DEBUG": "WARN",
+
+            "VLLM_USE_V1": "1",
             "VLLM_LOGGING_LEVEL": "WARN",
+            "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+            "VLLM_DISABLE_COMPILE_CACHE": "1",
+
+            "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+
+            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
             "TOKENIZERS_PARALLELISM": "true",
             # use ajet.backbone as plugin directory
             "TRINITY_PLUGIN_DIRS": str((Path(__file__).parent.parent / "backbone").resolve()),
             # "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
             "SWANLAB_API_KEY": os.getenv("SWANLAB_API_KEY", ""),
+            "SWANLAB_LOG_DIR": os.getenv("SWANLAB_LOG_DIR", "saved_experiments/swanlog"),
             "AJET_CONFIG_REDIRECT": os.getenv("AJET_CONFIG_REDIRECT", ""),
             "AJET_DAT_INTERCHANGE_PORT": os.getenv("AJET_DAT_INTERCHANGE_PORT", data_interchange_port),
             "MASTER_NODE_IP": os.getenv("MASTER_NODE_IP", master_node_ip),
@@ -45,6 +54,8 @@ def get_runtime_env(config, is_trinity: bool = False) -> dict:
         "BEST_LOGGER_WEB_SERVICE_URL",
         "AJET_GIT_HASH",
         "AJET_REQ_TXT",
+        "SWANLAB_WEB_HOST",
+        "SWANLAB_API_HOST",
         "AJET_BENCHMARK_NAME",
         "FINANCE_MCP_URL",
         # API Keys for RM Gallery and other services
@@ -53,6 +64,12 @@ def get_runtime_env(config, is_trinity: bool = False) -> dict:
         "OPENAI_BASE_URL",
         "API_KEY",
         "BASE_URL",
+        "AGENTJET_FIND_MAX_PPO_TOKEN_LEN",
+        "AGENTJET_FIND_MAX_START",
+        "AGENTJET_FIND_MAX_CAP",
+        "AGENTJET_FIND_MAX_TOL",
+        "AGENTJET_FIND_MAX_BUDGET_S",
+        "AGENTJET_FIND_MAX_SEQ",
     ]
 
     for var in optional_env_vars:

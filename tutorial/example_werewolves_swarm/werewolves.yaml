@@ -5,17 +5,19 @@ ajet:
 
   model:
     # ✨ select model to be trained
-    path: /mnt/data_cpfs/model_cache/modelscope/hub/Qwen/Qwen/Qwen2___5-7B-Instruct
+    # path: /mnt/data_cpfs/model_cache/modelscope/hub/Qwen/Qwen/Qwen2___5-7B-Instruct
+    path: /mnt/data_cpfs/model_cache/modelscope/hub/Qwen/Qwen/Qwen2___5-14B-Instruct
 
 
   rollout:
     user_workflow: null
     temperature: 0.7
     max_env_worker: 64
+    gpu_memory_utilization: 0.75
     num_repeat: 6
     agent_madness_reward: 0.0
     tensor_model_parallel_size: 1
-    # max_num_seqs: 40
+    # max_num_seqs: 64
     # monitor LLM's abormal behaviors during rollout
     compute_madness_checklist:
       - "nonsense"
@@ -37,7 +39,7 @@ ajet:
   interchange_server:
     interchange_method: 'ipc' # options: 'tcp' (multi-nodes) or  'ipc' (1 node)
     interchange_server_port: 10086
-    num_fastapi_process: 2  # 1, 2 or 4 is fine
+    num_fastapi_process: 1  # 1, 2 or 4 is fine
     max_fastapi_threads: 512  # 64 or 128 is fine
     max_inference_tracker_threads: 64 # recommend to be equal to `ajet.rollout.max_env_worker`
     already_started: False # do not edit, used by `swarm`
@@ -57,9 +59,20 @@ ajet:
     save_freq: 5
     test_freq: 9999999
     total_epochs: 9999999
-    total_training_steps: 25
+    total_training_steps: 75
     nnodes: 1
     n_gpus_per_node: 8
+    lr: 3.0e-4
+
+  lora:
+    load_format: safetensors
+
+
+
+actor_rollout_ref:
+  rollout:
+    layered_summon: True
+
 
 # ------------------ do not edit ------------------
 hydra:

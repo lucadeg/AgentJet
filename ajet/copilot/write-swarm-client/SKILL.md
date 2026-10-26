@@ -1,6 +1,6 @@
 ---
 name: write-swarm-client
-description: Create a trainable agent loop or agent workflow with AgentJet
+description: Create an active, dataset-driven AgentJet swarm client. Write agent_roll.py and agent_run.py that iterate through a dataset, execute agent workflows, and compute rewards for reinforcement learning training with AgentJet Swarm.
 license: Complete terms in LICENSE.txt
 ---
 
@@ -152,11 +152,34 @@ Below are some reference materials.
         model='/mnt/data_cpfs/model_cache/modelscope/hub/Qwen/Qwen/Qwen2.5-3B-Instruct',
         batch_size=LOCAL_GRPO_N,
         num_repeat=4,
+        # LoRA parameters (optional, for parameter-efficient fine-tuning):
+        # lora_rank=8,           # Set > 0 to enable LoRA training (default: 0 = disabled)
+        # lora_alpha=16,         # LoRA alpha scaling factor (default: 16)
+        # lora_target_modules="all-linear",  # Target modules for LoRA (default: "all-linear")
     )
     # hint: you can `yaml_job.dump_job_as_yaml('./config.yaml')` to take a look at the full configuration
     # hint: you can `yaml_job.build_job_from_yaml('./config.yaml')` to load yaml configuration as override. (there are some configurations that must be edited from yaml)
     swarm_worker.auto_sync_train_config_and_start_engine(yaml_job)
     ```
+
+    **LoRA Training**: To enable LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning, set `lora_rank > 0`. This significantly reduces GPU memory usage and training time while maintaining good performance.
+
+    **Full AgentJetJob Arguments**: Run `help(AgentJetJob)` or check `ajet/copilot/job.py` for all available parameters including:
+
+    | Parameter | Description |
+    |-----------|-------------|
+    | `model` | Path to the model to train |
+    | `n_gpu` | Number of GPUs per node |
+    | `algorithm` | Advantage estimator (e.g., 'grpo') |
+    | `batch_size` | Training batch size |
+    | `num_repeat` | Number of repeated samples per task |
+    | `max_prompt_length` | Maximum prompt token length |
+    | `max_response_length` | Maximum response token length |
+    | `max_model_len` | Maximum total token length |
+    | `mini_batch_num` | Number of mini-batches per update |
+    | `lora_rank` | LoRA rank (0 = disabled, >0 = enabled) |
+    | `lora_alpha` | LoRA alpha scaling factor |
+    | `lora_target_modules` | Target modules for LoRA |
 
     The swarm server can be in the following states and transition between them as follows:
     - **OFFLINE**: The swarm server is started but does not load any models or perform any training. It enters this state directly after startup. Additionally, it transitions to this state upon receiving a `stop_engine` command from (any) client while in any other state.
@@ -193,6 +216,10 @@ Below are some reference materials.
     By default, when enough amount (>=batch size) of samples (with reward) reach the swarm server, that when a llm weight update step begins.
     Please run `ajet-swarm overwatch` during training, this panel displays everything about the weight update timing, transparently.
     When opening this panel, you can see 3 modes which you can select from: "rollout_until_finish_enough_episodes"(only count episodes), "rollout_until_finish_enough_tasks" (+consider task group), "rollout_until_finish_enough_non_dummy_tasks" (+consider group reward)
+
+    Another important thing to notice: each task must have a valid task_id (str), which is used to:
+        - Group up epsiodes that belong to same task inside swarm server (you do not have to worry about that).
+        - Used as a random seed if the task is a game requires random initialization. (e.g. werewolves game's player identity)
 
 
     ### 2-3. Intergrate with your agent loop.
@@ -275,6 +302,7 @@ Below are some reference materials.
         model=REMOTE_TRAIN_MODEL_01,
         batch_size=REMOTE_BATCH_SIZE,
         num_repeat=LOCAL_GRPO_N,
+        # LoRA (optional): lora_rank=8, lora_alpha=16, lora_target_modules="all-linear"
     )
 
     swarm_worker.sync_train_config(yaml_job)
@@ -285,6 +313,8 @@ Below are some reference materials.
     Hints:
     - You can `yaml_job.dump_job_as_yaml('./config.yaml')` to take a look at the full configuration.
     - You can `yaml_job.build_job_from_yaml('./config.yaml')` to load yaml configuration as override. (there are some configurations that must be edited from yaml).
+    - For LoRA training, set `lora_rank > 0` (e.g., 8 or 16) to enable parameter-efficient fine-tuning.
+    - **Full argument list**: Run `help(AgentJetJob)` or check `ajet/copilot/job.py` for all available parameters.
 
     ### (D1-2) Write your agent & reward
 
@@ -343,29 +373,24 @@ Below are some reference materials.
     Training is as simple as this:
 
     ```python
-    next_batch = []
+    executor = PeriodicDrainThreadPoolExecutor(workers=REMOTE_BATCH_SIZE * LOCAL_GRPO_N, max_parallel=64, auto_retry=True)
     for _ in range(LOCAL_NUM_EPOCHN):
         for _, task in enumerate(dataset.generate_training_tasks()):
             for _ in range(LOCAL_GRPO_N):
-                next_batch.append(task)
-                if len(next_batch) >= (REMOTE_BATCH_SIZE * LOCAL_GRPO_N):
-                    episode_results = run_episodes_until_all_complete(next_batch, func=rollout, auto_retry=True)
-                    print(episode_results)
-                    next_batch.clear()
+                executor.submit_with_periodic_drain(fn=rollout, task=task)
     ```
 
     You may find it hard to belive this code is a training cycle at first, but this is how simple things can become in AgentJet.
 
     Just run your agents again and again in a loop, batch after batch, swarm server will take care of everything else.
 
-    Hint: you do not have to use `run_episodes_until_all_complete`, you are free to (let AI help you) design your own threading control logic.
-
     ### (D1-4) Full code
 
     ```python
     from ajet.copilot.job import AgentJetJob
-    from ajet.tuner_lib.experimental.swarm_client import SwarmClient, run_episodes_until_all_complete
-    from ajet.default_config.ajet_default import AjetTaskReader, HuggingfaceDatRepo
+    from ajet.tuner_lib.experimental.swarm_client import SwarmClient
+    from ajet.utils.thread_executors import PeriodicDrainThreadPoolExecutor
+    from ajet.default_config.ajet_config_schema import AjetTaskReader, HuggingfaceDatRepo
     from ajet.task_reader import RouterTaskReader
     from tutorial.example_academic_trans_swarm.trans import execute_agent
 
@@ -416,14 +441,10 @@ Below are some reference materials.
             swarm_worker.print_rollout_stat()
             return workflow_output.reward
 
-        next_batch = []
+        executor = PeriodicDrainThreadPoolExecutor(workers=REMOTE_BATCH_SIZE * LOCAL_GRPO_N, max_parallel=64, auto_retry=True)
         for _, task in enumerate(dataset.generate_training_tasks()):
             for _ in range(LOCAL_GRPO_N):
-                next_batch.append(task)
-                if len(next_batch) >= (REMOTE_BATCH_SIZE * LOCAL_GRPO_N):
-                    episode_results = run_episodes_until_all_complete(next_batch, func=rollout, auto_retry=True)
-                    print(episode_results)
-                    next_batch.clear()
+                executor.submit_with_periodic_drain(fn=rollout, task=task)
         return None
 
 
@@ -555,14 +576,10 @@ Below are some reference materials.
         # Return the average reward for logging purposes
         return (workflow_output_7b.reward + workflow_output_14b.reward) / 2.0
 
-    next_batch = []
+    executor = PeriodicDrainThreadPoolExecutor(workers=REMOTE_7B_BATCH_SIZE * LOCAL_GRPO_N, max_parallel=64, auto_retry=True)
     for _, task in enumerate(dataset.generate_training_tasks()):
         for _ in range(LOCAL_GRPO_N):
-            next_batch.append(task)
-            if len(next_batch) >= (REMOTE_7B_BATCH_SIZE * LOCAL_GRPO_N):
-                episode_results = run_episodes_until_all_complete(next_batch, func=rollout, auto_retry=True)
-                print(episode_results)
-                next_batch.clear()
+            executor.submit_with_periodic_drain(fn=rollout, task=task)
     ```
 
 ## [Demo 3] Distributed Agentic RL (1 server, many clients, 1 dataset)
@@ -586,6 +603,7 @@ Below are some reference materials.
             algorithm="grpo", project_name="ajet-swarm", experiment_name="test",
             n_gpu=8, model="/path/to/llm/model",
             batch_size=128, num_repeat=4,
+            # LoRA (optional): lora_rank=8, lora_alpha=16, lora_target_modules="all-linear"
         )
         swarm_worker.sync_train_config(yaml_job)
         swarm_worker.start_engine()
@@ -602,14 +620,10 @@ Below are some reference materials.
 
     ```python
     N_CLIENTS = 2
-    next_batch = []
+    executor = PeriodicDrainThreadPoolExecutor(workers=REMOTE_BATCH_SIZE // N_CLIENTS * LOCAL_GRPO_N, max_parallel=64, auto_retry=True)
     for _, task in enumerate(dataset.generate_training_tasks()):
         for _ in range(LOCAL_GRPO_N):
-            next_batch.append(task)
-            if len(next_batch) >= (REMOTE_BATCH_SIZE // N_CLIENTS * LOCAL_GRPO_N):
-                episode_results = run_episodes_until_all_complete(next_batch, func=rollout, auto_retry=True)
-                print(episode_results)
-                next_batch.clear()
+            executor.submit_with_periodic_drain(fn=rollout, task=task)
     ```
 
     Save swarm client program as script: `swarm_client_roll.py`,

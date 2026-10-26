@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from ajet.utils.cleaner import fast_kill_by_keyword_bash
+from ajet.utils.cleaner import AUTOKILL_KEYWORDS, fast_kill_by_keyword_bash
 from ajet.utils.config_utils import prepare_experiment_config
 from ajet.utils.launch_utils import (
     execute_training_process,
@@ -177,7 +177,7 @@ def main():
             check_avail_gpu(min_free_ratio=0.95)
 
     if args.autokill:
-        args.kill = "ray|vllm|VLLM|python"
+        args.kill = AUTOKILL_KEYWORDS
 
     # Handle kill-keywords argument if provided
     if args.kill:
@@ -207,7 +207,7 @@ def main():
     if args.swarm_server and (not args.conf):
         args.conf = os.path.abspath(
             os.path.join(
-                os.path.dirname(__file__), "default_config/ajet_ts_default.yaml"
+                os.path.dirname(__file__), "default_config/ajet_swarm_default.yaml"
             )
         )
         assert os.path.exists(args.conf), (

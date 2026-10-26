@@ -4,6 +4,13 @@ import subprocess
 import time
 
 
+# Canonical autokill keyword set. The string is `|`-separated to match the
+# `--kill` CLI flag, which expects `kw1|kw2|...`. Every site that wants the
+# "kill all training-related processes" behavior must import this constant
+# rather than re-declaring the literal.
+AUTOKILL_KEYWORDS = "ray|vllm|VLLM|python"
+
+
 def kill_ray_processes():
     """run ray stop command to kill ray processes"""
     try:
@@ -20,7 +27,7 @@ def kill_ray_processes():
 
 def fast_kill_by_keyword_bash(
     keyword: str,
-    exclude_substrings=["vscode", "benchmark", "jupyter", "supervisord", "download_model"],
+    exclude_substrings=["alpha", "vscode", "benchmark", "jupyter", "supervisord", "download_model", "opencode", "opencodex", "pai-nohang"],
     grace_seconds: float = 1.0,
 ):
     """Use bash pipelines to kill processes matching keyword quickly.

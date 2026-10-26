@@ -1,6 +1,6 @@
 ---
 name: train-complex-blackbox
-description: Create a trainable agent loop or agent workflow with AgentJet
+description: Train complex blackbox agents (agents without clear reward signals) using AgentJet. Write dataset collectors, episode runners with LLM-as-Judge reward functions, and integrate with the AgentJet training loop.
 license: Complete terms in LICENSE.txt
 ---
 
@@ -54,7 +54,7 @@ from ajet.copilot.job import AgentJetJob
 from ajet.task_reader import RouterTaskReader
 from ajet.utils.thread_executors import PeriodicDrainThreadPoolExecutor
 from ajet.tuner_lib.as_oai_baseurl_apikey import OpenaiBaseUrlAndApiKey
-from ajet.default_config.ajet_default import AjetTaskReader, HuggingfaceDatRepo
+from ajet.default_config.ajet_config_schema import AjetTaskReader, HuggingfaceDatRepo
 from ajet.tuner_lib.experimental.swarm_client import SwarmClient
 
 # python -m tutorial.example_math_swarm.math
@@ -100,6 +100,11 @@ def main():
         model=REMOTE_MODEL_PATH,
         batch_size=REMOTE_BATCH_SIZE,
         num_repeat=GRPO_N,
+        # LoRA parameters (optional, for parameter-efficient fine-tuning):
+        # lora_rank=8,           # Set > 0 to enable LoRA training (default: 0 = disabled)
+        # lora_alpha=16,         # LoRA alpha scaling factor (default: 16)
+        # lora_target_modules="all-linear",  # Target modules for LoRA (default: "all-linear")
+        # Full argument list: run `help(AgentJetJob)` or check `ajet/copilot/job.py`
     )
     print(ajet_job.config.to_dict())
     swarm_worker.auto_sync_train_config_and_start_engine(

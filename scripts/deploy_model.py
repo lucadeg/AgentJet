@@ -9,20 +9,20 @@ sys.path.append(os.getcwd())  # noqa: E402
 
 from loguru import logger  # noqa: E402
 
-from ajet.utils.cleaner import fast_kill_by_keyword_bash  # noqa: E402
+from ajet.utils.cleaner import AUTOKILL_KEYWORDS, fast_kill_by_keyword_bash  # noqa: E402
 from ajet.utils.smart_daemon import LaunchCommandWhenAbsent  # noqa: E402
 
 parser = argparse.ArgumentParser(description="deploy Hugging Face model")
 parser.add_argument(
     "--target",
-    # default="/mnt/data_cpfs/model_cache/modelscope/hub/Qwen/Qwen/Qwen3-235B-A22B-Instruct-2507/",
-    default="/mnt/data_cpfs/model_cache/modelscope/hub/Qwen/Qwen/Qwen2___5-14B-Instruct",
+    default="/mnt/data_cpfs/model_cache/modelscope/hub/Qwen/Qwen/Qwen3-235B-A22B-Instruct-2507/",
+    # default="/mnt/data_cpfs/model_cache/modelscope/hub/Qwen/Qwen/Qwen2___5-14B-Instruct",
     type=str,
     help="Model path",
 )
 parser.add_argument(
     "--alias",
-    default="Qwen/Qwen2.5-14B-Instruct",
+    default="Qwen/Qwen3-235B-A22B-Instruct-2507",
     type=str,
     help="Model alias",
 )
@@ -42,7 +42,7 @@ parser.add_argument("--port", default="2888", type=str, help="Port number")
 args = parser.parse_args()
 
 if args.autokill:
-    args.kill = "ray|vllm|VLLM|python"
+    args.kill = AUTOKILL_KEYWORDS
 
 # Handle kill-keywords argument if provided
 if args.kill:

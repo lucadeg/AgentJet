@@ -14,7 +14,6 @@ from omegaconf import DictConfig
 
 from ajet.utils.config_computer import split_keys_and_operators
 
-DEFAULT_DIR = "saved_experiments"
 
 def fix_hydra_searchpath_and_create_copy_when_needed(yaml_fp):
     """Fix Hydra search paths if they don't exist by trying with base directory."""
@@ -76,14 +75,18 @@ def dump_yaml_config(cfg: DictConfig, yaml_fp: str):
     return yaml_fp
 
 
+class NotFound(object): pass
+
 def _dive_to_fetch_value(config, dotted_key):
     keys = dotted_key.split(".")
     value = config
     for key in keys:
-        value = value.get(key, None)
+        value = value.get(key, NotFound)
         if value is None:
             break
-    if value is None:
+        if value is NotFound:
+            break
+    if value is NotFound:
         raise ValueError(f"[Warning]: Cannot find value for key: {dotted_key} in {config}")
     return value
 
@@ -100,6 +103,7 @@ def _dive_to_set_value(config, dotted_key, value):
 
 def align_parameters(from_config_fp, to_config_fp, convertion_json_fg, backbone):
     """Align configuration values based on a conversion map.
+    Please check `ajet/default_config/verl/config_auto_convertion_verl.jsonc`.
 
     Parameters
     ----------
@@ -145,6 +149,7 @@ def align_parameters(from_config_fp, to_config_fp, convertion_json_fg, backbone)
     for from_key, to_keys in convertion_json.items():
         if from_key.startswith("("):
             # special argument that need A.S.T. computation
+            # e.g. "(min(ajet.rollout.max_env_worker, 128) // ajet.rollout.n_vllm_engine)": "explorer.runner_per_model"
             keys_array, config_computer = split_keys_and_operators(from_key, [])
             value = config_computer({k: _dive_to_fetch_value(from_config, k) for k in keys_array})
         else:
@@ -161,8 +166,22 @@ def align_parameters(from_config_fp, to_config_fp, convertion_json_fg, backbone)
                 f"[Note]: Aligned parameter from [{from_key}] to [{to_key}] with value: [{value}]"
             )
 
+    # [AJET] ajet.rollout.ppo_max_token_len_per_gpu is the SOLE source of the actor's per-gpu PPO
+    # token budget (it is deliberately NOT pulled in via the ajet.rollout.max_model_len mapping
+    # above). None means "track max_model_len" (legacy behaviour); an explicit int decouples the
+    # PPO update budget from max_model_len. The verl key only carries the resolved value so it can
+    # reach the Ray actor (which receives the actor_rollout_ref subtree, not the ajet namespace).
+    ppo_token_len = _dive_to_fetch_value(from_config, "ajet.rollout.ppo_max_token_len_per_gpu")
+    if ppo_token_len is None:
+        ppo_token_len = _dive_to_fetch_value(from_config, "ajet.rollout.max_model_len")
+    _dive_to_set_value(to_config, "actor_rollout_ref.actor.ppo_max_token_len_per_gpu", ppo_token_len)
+    logger.success(
+        f"[Note]: Resolved [actor_rollout_ref.actor.ppo_max_token_len_per_gpu] = [{ppo_token_len}] "
+        "from [ajet.rollout.ppo_max_token_len_per_gpu] (None => ajet.rollout.max_model_len)."
+    )
+
     # backbone specific safe guard
-    to_config = config_safe_guard(to_config, backbone)
+    to_config = align_parameter_safe_guard(to_config, backbone)
 
     # save to_config_fp
     with open(to_config_fp, "w", encoding="utf-8") as file:
@@ -172,10 +191,26 @@ def align_parameters(from_config_fp, to_config_fp, convertion_json_fg, backbone)
     print_dict({"Note": f"Saved aligned configuration to {to_config_fp}"}, header="Final Configuration")
 
 
-def config_safe_guard(config: dict, backbone: str) -> dict:
+def align_parameter_safe_guard(config: dict, backbone: str) -> dict:
     # special: logger
     if backbone == "verl" and isinstance(config["trainer"]["logger"], str):
         config["trainer"]["logger"] = ["console", config["trainer"]["logger"]]
+
+    # special: LoRA requires safetensors load_format and layered_summon
+    if backbone == "verl":
+        lora_rank = config.get("actor_rollout_ref", {}).get("model", {}).get("lora_rank", 0)
+        load_format = config.get("actor_rollout_ref", {}).get("rollout", {}).get("load_format", "auto")
+        layered_summon = config.get("actor_rollout_ref", {}).get("rollout", {}).get("layered_summon", False)
+        if lora_rank > 0 and load_format != "safetensors":
+            raise ValueError(
+                f"LoRA training (lora_rank={lora_rank}) requires load_format='safetensors', "
+                f"but got load_format='{load_format}'. Please set `ajet.lora.load_format: safetensors` in your config."
+            )
+        if lora_rank > 0 and not layered_summon:
+            raise ValueError(
+                f"LoRA training (lora_rank={lora_rank}) requires layered_summon=True, "
+                f"but got layered_summon={layered_summon}. Please set `ajet.lora.layered_summon: true` in your config."
+            )
 
     # special: trinity train_batch_size
     if backbone == "trinity":
@@ -278,6 +313,41 @@ def expand_ajet_hierarchical_config(config, write_to=None):
     return config_final
 
 
+def _validate_input_yaml_no_overlap_with_auto_convertion_config(input_yaml_config, config_final):
+    """Validate that input yaml doesn't contain keys in fields such as `actor_rollout_ref` that will be override by `ajet` field values."""
+    import json
+    import re
+
+    jsonc_path = os.path.join(os.path.dirname(__file__), "..", "default_config", "verl", "config_auto_convertion_verl.jsonc")
+    with open(jsonc_path, "r", encoding="utf-8") as f:
+        content = f.read()
+        content = re.sub(r'//.*', '', content)
+        convertion_json = json.loads(content)
+
+    errors = []
+    for from_key, to_keys in convertion_json.items():
+        to_keys = to_keys if isinstance(to_keys, list) else [to_keys]
+        for to_key in to_keys:
+            try:
+                input_value = _dive_to_fetch_value(input_yaml_config, to_key)
+            except ValueError:
+                continue
+            final_value = _dive_to_fetch_value(config_final, to_key)
+            if str(input_value) != str(final_value):
+                errors.append(
+                    f"  - Key '{to_key}': input_yaml value = {input_value}, "
+                    f"but ajet config sets it to = {final_value}"
+                )
+
+    if errors:
+        error_msg = (
+            "We found a configuration conflict between AgentJet and Verl! Input yaml contains keys that conflict with ajet default config values:\n"
+            + "\n".join(errors)
+            + "\nPlease use ajet.xxx to assign training parameters instead."
+        )
+        raise ValueError(error_msg)
+
+
 def prepare_experiment_config(yaml_path, exp_base_dir, backbone, override_param_callback=None, storage=True):
     """
     Prepare experiment configuration by reading YAML, setting up backup directories,
@@ -292,24 +362,23 @@ def prepare_experiment_config(yaml_path, exp_base_dir, backbone, override_param_
         tuple: (yaml_backup_dst, exe_exp_base, exp_name, config_final)
     """
     assert yaml_path.endswith(".yaml"), "Configuration file must be a YAML file"
-    exp_base = os.path.exists(os.path.dirname(yaml_path))
+    exp_base = os.path.dirname(yaml_path)
 
     if not os.path.exists(exp_base):
         raise FileNotFoundError(f"Configuration file not found: {exp_base}")
 
     ## 0. read yaml & get experiment_name
     with open(yaml_path, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file)
+        config = input_yaml_config = yaml.safe_load(file)
     try:
         exp_name = config.get("ajet").get("experiment_name")
     except Exception:
         raise ValueError(f"Please set ajet field in yaml file. Current yaml:\n{config}")
     if exp_name is None or exp_name == "read_yaml_name":
-        if exp_name is not None:
-            exp_name = exp_name.replace("|", "-")
         exp_name = os.path.basename(yaml_path).replace(".yaml", "")
-        # add timestamp to exp_name
-        timestamp = time.strftime("%Y%m%d_%H%M", time.localtime())
+        # add timestamp to exp_name (with milliseconds to avoid concurrency conflicts)
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # trim to milliseconds
         exp_name = f"{exp_name}_{timestamp}"
     else:
         exp_name = exp_name.replace("|", "-")
@@ -366,6 +435,8 @@ def prepare_experiment_config(yaml_path, exp_base_dir, backbone, override_param_
         override_param_callback=override_param_callback
     )
     config_final = expand_ajet_hierarchical_config(config, write_to=yaml_backup_dst)
+
+    _validate_input_yaml_no_overlap_with_auto_convertion_config(input_yaml_config, config_final)
 
     if not storage:
         shutil.rmtree(os.path.join(exp_base_dir, exp_name))

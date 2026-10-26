@@ -1,11 +1,13 @@
 import logging
 import os
+import random
 import shutil
 import subprocess
 import sys
 import time
 
 from beast_logger import print_dict
+from beast_logger import register_console
 from loguru import logger
 from types import SimpleNamespace
 
@@ -71,15 +73,15 @@ def setup_environment_vars(args, exp_config, main_yaml_fp):
 
 
 def set_loguru_default_color():
-    logger.remove()
+    register_console()
     colorize = os.environ.get("LOGURU_COLORIZE", "YES").upper() not in ["NO", "0", "FALSE"]
-    logger.add(sys.stderr, colorize=colorize, enqueue=False)
     if not colorize:
         os.environ["RAY_COLOR_PREFIX"] = "0"
 
-    logging.getLogger("vllm.entrypoints.openai.tool_parsers.hermes_tool_parser").setLevel(
-        logging.CRITICAL
-    )
+    target_logger = logging.getLogger("vllm.entrypoints.openai.tool_parsers.hermes_tool_parser")
+    target_logger.setLevel(logging.CRITICAL)
+    target_logger = logging.getLogger("vllm.tool_parsers.hermes_tool_parser")
+    target_logger.setLevel(logging.CRITICAL)
     return
 
 
@@ -103,6 +105,7 @@ def check_debugpy_version():
             "Upgrade using 'pip install debugpy>=1.8.0'"
         )
     logger.info(f"✓ debugpy version {version} meets requirement (>=1.8.0)")
+    time.sleep(random.uniform(0, 4))
 
 
 def check_avail_gpu(min_free_ratio: float = 0.95):
@@ -218,6 +221,9 @@ def start_ray_service(args, env, cluster=False):
     # Get the current Python interpreter directory
     python_dir = os.path.dirname(sys.executable)
     ray_path = os.path.join(python_dir, "ray")
+    # if CUDA_VISIBLE_DEVICES is set, remove it from `env`
+    if "CUDA_VISIBLE_DEVICES" in env:
+        del env["CUDA_VISIBLE_DEVICES"]
     if not cluster:
         companion = LaunchCommandWhenAbsent(
             full_argument_list=[f"{ray_path} start --head --block"],
@@ -251,7 +257,7 @@ def start_ray_service(args, env, cluster=False):
                 tag="ray_service_worker",
                 use_pty=True,
             )
-            launch_wait_time = 9999999999
+            launch_wait_time = 9999999999999
             # success_std_string = "Connected to Ray cluster"
             success_std_string = "Just wait here forever"
     companion.launch(
@@ -297,7 +303,7 @@ def verify_python_env(args, exp_config):
             time.sleep(5)
             raise ImportError(cause + " " + solution)
     elif args.backbone == "verl":
-        if not any([v in verl.__version__ for v in ["0.5.0.post", "0.5.0.dev", "0.7.0.post"]]):  # you must install via `pip install -e .[verl]` to get every dependency right
+        if not any([v in verl.__version__ for v in ["0.5.0.post", "0.5.0.dev", "0.7.0.post", "0.7.1", "0.8.0.dev"]]):  # you must install via `pip install -e .[verl]` to get every dependency right
             cause = "Python environment does not match current backbone 'verl'."
             solution = "Please `cd /path/to/project/AgentJet` and run `(uv) pip install -e .[verl]` to install the correct environment."
             print_dict(
@@ -333,17 +339,31 @@ def execute_training_process(
         env: Environment variables dictionary
     """
 
+    isolated_agentjet_dir = env.get("ISOLATED_AGENTJET_BASE_DIR") or os.getenv(
+        "ISOLATED_AGENTJET_BASE_DIR", ""
+    )
+    if isolated_agentjet_dir:
+        isolated_agentjet_dir = os.path.abspath(isolated_agentjet_dir)
+
+    def resolve_ajet_asset(path):
+        if isolated_agentjet_dir:
+            return os.path.join(isolated_agentjet_dir, path)
+        return path
+
     # Fixed config asset locations
-    TRINITY_BOOT_YAML = "ajet/default_config/trinity/trinity_launch.yaml"  # THIS FILE IS READ ONLY, and ALWAYS FIXED
+    TRINITY_BOOT_YAML = resolve_ajet_asset(
+        "ajet/default_config/trinity/trinity_launch.yaml"
+    )  # THIS FILE IS READ ONLY, and ALWAYS FIXED
     TRINITY_CONFIG_AUTO_CONVERSION = (
-        "ajet/default_config/trinity/config_auto_convertion_trinity.jsonc"
+        resolve_ajet_asset("ajet/default_config/trinity/config_auto_convertion_trinity.jsonc")
     )
     VERL_CONFIG_AUTO_CONVERSION = (
-        "ajet/default_config/verl/config_auto_convertion_verl.jsonc"
+        resolve_ajet_asset("ajet/default_config/verl/config_auto_convertion_verl.jsonc")
     )
 
-    os.makedirs('/tmp/ajet', exist_ok=True)
-    assert os.path.exists('/tmp/ajet'), "Temporary directory /tmp/ajet cannot be create."
+    runtime_tmp_dir = os.getenv("AJET_IPC_DIR", "/tmp/agentjet")
+    os.makedirs(runtime_tmp_dir, exist_ok=True)
+    assert os.path.exists(runtime_tmp_dir), (f"Temporary directory {runtime_tmp_dir} cannot be created.")
 
     # let's begin the training process
     if args.backbone == "trinity":
@@ -401,7 +421,19 @@ def execute_training_process(
             header="Final Training Command & Directory",
         )
         verify_python_env(args, exp_config)
-        subprocess.run(cmd, check=True, cwd=os.path.abspath("./"), env=env)
+        if isolated_agentjet_dir:
+            assert os.path.exists(isolated_agentjet_dir), \
+                f"ISOLATED_AGENTJET_BASE_DIR is set to {isolated_agentjet_dir} but this path does not exist."
+            assert os.path.exists(os.path.join(isolated_agentjet_dir, "ajet")), \
+                f"ISOLATED_AGENTJET_BASE_DIR is set to {isolated_agentjet_dir} but this path does not exist."
+            env["PYTHONPATH"] = (
+                os.path.abspath(isolated_agentjet_dir)
+                + os.pathsep
+                + env.get("PYTHONPATH", "")
+            )
+            subprocess.run(cmd, check=True, cwd=isolated_agentjet_dir, env=env)
+        else:
+            subprocess.run(cmd, check=True, cwd=os.path.abspath("./"), env=env)
     except subprocess.CalledProcessError as e:
         logger.error(f"Error running subprocess: {e}")
         if is_swarm_server:

@@ -463,6 +463,7 @@ On your GPU machine (or cluster), start the Swarm Server:
 ajet-swarm start
 
 # Open the monitoring dashboard in another terminal
+# tip: ajet-swarm top is an alias for ajet-swarm overwatch
 ajet-swarm overwatch --swarm-url=http://localhost:10086
 ```
 
@@ -471,6 +472,9 @@ ajet-swarm overwatch --swarm-url=http://localhost:10086
     ```bash
     ajet-swarm start --swarm-port=10086
     ```
+
+!!! tip "Auto-start Local Server"
+    If the client runs on the same machine as the swarm server, you can skip the manual `ajet-swarm start` command and use `SwarmClient(AJET_SWARM_URL, auto_start_swarm_server=True)`. This only supports `localhost` or `127.0.0.1`; for a remote GPU server, start `ajet-swarm start` on that server first.
 
 The Swarm Server will:
 
@@ -496,7 +500,7 @@ Create your client script. The client reads the dataset, runs the agent workflow
     from ajet.task_reader import RouterTaskReader
     from ajet.utils.thread_executors import PeriodicDrainThreadPoolExecutor
     from ajet.tuner_lib.as_oai_baseurl_apikey import OpenaiBaseUrlAndApiKey
-    from ajet.default_config.ajet_default import AjetTaskReader, HuggingfaceDatRepo
+    from ajet.default_config.ajet_config_schema import AjetTaskReader, HuggingfaceDatRepo
     from ajet.tuner_lib.experimental.swarm_client import SwarmClient
 
     # Configuration
@@ -519,7 +523,7 @@ Create your client script. The client reads the dataset, runs the agent workflow
         )
 
         # Connect to swarm server and configure training
-        swarm_worker = SwarmClient(AJET_SWARM_URL)
+        swarm_worker = SwarmClient(AJET_SWARM_URL, auto_start_swarm_server=True)
         swarm_worker.auto_sync_train_config_and_start_engine(
             AgentJetJob(
                 experiment_name="math_gsm8k_grpo",
@@ -528,6 +532,7 @@ Create your client script. The client reads the dataset, runs the agent workflow
                 model=REMOTE_MODEL_PATH,
                 batch_size=REMOTE_BATCH_SIZE,
                 num_repeat=GRPO_N,
+                # LoRA (optional): lora_rank=8, lora_alpha=16, lora_target_modules="all-linear"
             ),
             force_restart=True,
         )
@@ -649,7 +654,7 @@ The server handles gradient computation and model updates automatically.
     from ajet.task_reader import RouterTaskReader
     from ajet.utils.thread_executors import PeriodicDrainThreadPoolExecutor
     from ajet.tuner_lib.as_oai_baseurl_apikey import OpenaiBaseUrlAndApiKey
-    from ajet.default_config.ajet_default import AjetTaskReader, HuggingfaceDatRepo
+    from ajet.default_config.ajet_config_schema import AjetTaskReader, HuggingfaceDatRepo
     from ajet.tuner_lib.experimental.swarm_client import SwarmClient
 
     GRPO_N = 4  # grpo group size
@@ -672,7 +677,7 @@ The server handles gradient computation and model updates automatically.
         )
 
         # Connect to swarm server and configure training
-        swarm_worker = SwarmClient(AJET_SWARM_URL)
+        swarm_worker = SwarmClient(AJET_SWARM_URL, auto_start_swarm_server=True)
         swarm_worker.auto_sync_train_config_and_start_engine(
             AgentJetJob(
                 experiment_name="math_gsm8k_grpo",
@@ -681,6 +686,7 @@ The server handles gradient computation and model updates automatically.
                 model=REMOTE_MODEL_PATH,
                 batch_size=REMOTE_BATCH_SIZE,
                 num_repeat=GRPO_N,
+                # LoRA (optional): lora_rank=8, lora_alpha=16, lora_target_modules="all-linear"
             ),
             force_restart=True,
         )
@@ -753,7 +759,8 @@ The server handles gradient computation and model updates automatically.
 ### Continue Learning
 
 <div class="card-grid">
-<a href="../workflow/" class="feature-card"><div class="card-header"><img src="https://api.iconify.design/mdi:graph.svg" class="card-icon card-icon-agent" alt=""><h3>Workflow</h3></div><p class="card-desc">Learn to define trainable workflows and multi-agent setups.</p></a>
+<a href="../classic_workflow/" class="feature-card"><div class="card-header"><img src="https://api.iconify.design/mdi:graph.svg" class="card-icon card-icon-agent" alt=""><h3>Classic Workflow</h3></div><p class="card-desc">Learn to define trainable workflows and multi-agent setups.</p></a>
+<a href="../swarm_workflow/" class="feature-card"><div class="card-header"><img src="https://api.iconify.design/lucide:network.svg" class="card-icon card-icon-general" alt=""><h3>Swarm Workflow</h3></div><p class="card-desc">Distributed training with rollout on separate machines.</p></a>
 <a href="../data_pipeline/" class="feature-card"><div class="card-header"><img src="https://api.iconify.design/mdi:database.svg" class="card-icon card-icon-data" alt=""><h3>Data Pipeline</h3></div><p class="card-desc">Configure data loading from various sources.</p></a>
 <a href="../task_judger/" class="feature-card"><div class="card-header"><img src="https://api.iconify.design/mdi:check-decagram.svg" class="card-icon card-icon-general" alt=""><h3>Task Judger</h3></div><p class="card-desc">Set up reward functions for your training.</p></a>
 <a href="../example_math_agent/" class="feature-card"><div class="card-header"><img src="https://api.iconify.design/mdi:calculator-variant.svg" class="card-icon card-icon-math" alt=""><h3>Math Agent Example</h3></div><p class="card-desc">See the complete Math Agent implementation.</p></a>

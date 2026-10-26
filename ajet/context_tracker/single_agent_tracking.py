@@ -91,7 +91,7 @@ class SingleAgentContextTracker(BaseTracker):
         self.generated_token_cnt += len(vllm_output_raw_token)
         if not self.generation_prompt_token:
             self.generation_prompt_token = self.get_generation_prompt_token()
-        final_token_arr, token_logprob_arr, loss_mask, lack_normal_eos = replace_token_ids(
+        final_token_arr, token_logprob_arr, loss_mask, lack_normal_eos = replace_token_ids( # pad tokens and logprobs with begin_ids / other_ids / NA
             token_container=completion_token_arr,
             precise_token=vllm_output_raw_token,
             precise_logprob=vllm_output_raw_logprob,
@@ -178,7 +178,7 @@ class SingleAgentContextTracker(BaseTracker):
         step_reward = step_reward_base  # reward scalar
         if self.already_mad_flag:
             step_reward = self.config.ajet.rollout.agent_madness_reward
-            self.reward_structure.madness = -1.0
+            self.reward_structure.madness = -1
 
         return step_reward
 
@@ -187,7 +187,7 @@ class SingleAgentContextTracker(BaseTracker):
         for ext_msg in ext_msg_array:
             d: dict = {
                 "role": ext_msg.role,
-                "content": ext_msg.content_for_compare,
+                "content": ext_msg.text_content_for_compare,
             }
             if ext_msg.tool_calls:
                 d.update({"tool_calls": ext_msg.tool_calls})
@@ -206,6 +206,7 @@ class SingleAgentContextTracker(BaseTracker):
             config=self.config,
             task_batch_index=self.task_batch_index,
             task_tag=self.task_tag,
+            episode_uuid=self.episode_uuid,
             task_id=self.task_id,
         )
         sample.truncate_output_ids()
@@ -227,6 +228,7 @@ class SingleAgentContextTracker(BaseTracker):
                 config=self.config,
                 task_batch_index=self.task_batch_index,
                 task_tag=self.task_tag,
+                episode_uuid=self.episode_uuid,
                 task_id=self.task_id,
             )
             sample_arr += [sample]

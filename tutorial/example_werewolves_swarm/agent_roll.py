@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 
+# python -m tutorial.example_werewolves_swarm.agent_roll
+
 import os
 from ajet.schema.task import Task, WorkflowTask
 from ajet.copilot.job import AgentJetJob
 from ajet.task_reader import RouterTaskReader
 from ajet.utils.thread_executors import PeriodicDrainThreadPoolExecutor
 from ajet.tuner_lib.as_oai_baseurl_apikey import OpenaiBaseUrlAndApiKey
-from ajet.default_config.ajet_default import AjetTaskReader
+from ajet.default_config.ajet_config_schema import AjetTaskReader
 from ajet.tuner_lib.experimental.swarm_client import SwarmClient
 
 NUM_EPOCH = 10000
@@ -23,7 +25,7 @@ def main():
     ajet_job = AgentJetJob(
         base_yaml_config="tutorial/example_werewolves_swarm/werewolves.yaml",
         algorithm="grpo",
-        experiment_name="werewolves_swarm",
+        experiment_name="werewolves_swarm_14b",
         max_env_worker=128,
     )
 
@@ -62,7 +64,7 @@ def execute_agent(task: Task, api_baseurl_key: OpenaiBaseUrlAndApiKey):
     game = ExampleWerewolves(
         trainable_targets=["werewolf"],
         big_external_opponent_llm_name="Qwen/Qwen3-235B-A22B-Instruct-2507",
-        big_external_opponent_llm_url="http://22.14.116.243:2888/v1",
+        big_external_opponent_llm_url="http://22.13.222.137:2888/v1",
     )
     res = asyncio.run(game.execute(WorkflowTask(task=task), api_baseurl_key))
     return res

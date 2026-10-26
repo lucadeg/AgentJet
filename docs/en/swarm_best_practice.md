@@ -15,6 +15,7 @@ everything need to begin from bring the swarm server alive.
 We recommend launching server together with a swarm monitor:
 ```bash
 # this command start swarm server and a TUI to monitor the swarm server
+# tip: ajet-swarm top is an alias for ajet-swarm overwatch
 (ajet-swarm start &> ajet-swarm-server.log) & (ajet-swarm overwatch)
 ```
 
@@ -41,6 +42,7 @@ yaml_job = AgentJetJob(
     model=REMOTE_TRAIN_MODEL_01,
     batch_size=REMOTE_BATCH_SIZE,
     num_repeat=LOCAL_GRPO_N,
+    # LoRA (optional): lora_rank=8, lora_alpha=16, lora_target_modules="all-linear"
 )
 
 swarm_worker.sync_train_config(yaml_job)
@@ -52,6 +54,8 @@ Hints:
 
 - You can `yaml_job.dump_job_as_yaml('./config.yaml')` to take a look at the full configuration.
 - You can `yaml_job.build_job_from_yaml('./config.yaml')` to load yaml configuration as override. (there are some configurations that must be edited from yaml).
+- For LoRA training, set `lora_rank > 0` (e.g., 8 or 16) to enable parameter-efficient fine-tuning.
+- **Full argument list**: Run `help(AgentJetJob)` or check `ajet/copilot/job.py` for all available parameters.
 
 ### (D1-2) Write your agent & reward
 
@@ -111,29 +115,24 @@ it’s simple: just replace `end_episode` with `abort_episode`.
 Training is as simple as this:
 
 ```python
-next_batch = []
+executor = PeriodicDrainThreadPoolExecutor(workers=REMOTE_BATCH_SIZE * LOCAL_GRPO_N, max_parallel=64, auto_retry=True)
 for _ in range(LOCAL_NUM_EPOCHN):
     for _, task in enumerate(dataset.generate_training_tasks()):
         for _ in range(LOCAL_GRPO_N):
-            next_batch.append(task)
-            if len(next_batch) >= (REMOTE_BATCH_SIZE * LOCAL_GRPO_N):
-                episode_results = run_episodes_until_all_complete(next_batch, func=rollout, auto_retry=True)
-                print(episode_results)
-                next_batch.clear()
+            executor.submit_with_periodic_drain(fn=rollout, task=task)
 ```
 
 You may find it hard to belive this code is a training cycle at first, but this is how simple things can become in AgentJet.
 
 Just run your agents again and again in a loop, batch after batch, swarm server will take care of everything else.
 
-Hint: you do not have to use `run_episodes_until_all_complete`, you are free to (let AI help you) design your own threading control logic.
-
 ### (D1-4) Full code
 
 ```python
 from ajet.copilot.job import AgentJetJob
-from ajet.tuner_lib.experimental.swarm_client import SwarmClient, run_episodes_until_all_complete
-from ajet.default_config.ajet_default import AjetTaskReader, HuggingfaceDatRepo
+from ajet.tuner_lib.experimental.swarm_client import SwarmClient
+from ajet.utils.thread_executors import PeriodicDrainThreadPoolExecutor
+from ajet.default_config.ajet_config_schema import AjetTaskReader, HuggingfaceDatRepo
 from ajet.task_reader import RouterTaskReader
 from tutorial.example_academic_trans_swarm.trans import execute_agent
 
@@ -184,14 +183,10 @@ def main():
         swarm_worker.print_rollout_stat()
         return workflow_output.reward
 
-    next_batch = []
+    executor = PeriodicDrainThreadPoolExecutor(workers=REMOTE_BATCH_SIZE * LOCAL_GRPO_N, max_parallel=64, auto_retry=True)
     for _, task in enumerate(dataset.generate_training_tasks()):
         for _ in range(LOCAL_GRPO_N):
-            next_batch.append(task)
-            if len(next_batch) >= (REMOTE_BATCH_SIZE * LOCAL_GRPO_N):
-                episode_results = run_episodes_until_all_complete(next_batch, func=rollout, auto_retry=True)
-                print(episode_results)
-                next_batch.clear()
+            executor.submit_with_periodic_drain(fn=rollout, task=task)
     return None
 
 
@@ -323,14 +318,10 @@ def rollout(task):
     # Return the average reward for logging purposes
     return (workflow_output_7b.reward + workflow_output_14b.reward) / 2.0
 
-next_batch = []
+executor = PeriodicDrainThreadPoolExecutor(workers=REMOTE_7B_BATCH_SIZE * LOCAL_GRPO_N, max_parallel=64, auto_retry=True)
 for _, task in enumerate(dataset.generate_training_tasks()):
     for _ in range(LOCAL_GRPO_N):
-        next_batch.append(task)
-        if len(next_batch) >= (REMOTE_7B_BATCH_SIZE * LOCAL_GRPO_N):
-            episode_results = run_episodes_until_all_complete(next_batch, func=rollout, auto_retry=True)
-            print(episode_results)
-            next_batch.clear()
+        executor.submit_with_periodic_drain(fn=rollout, task=task)
 ```
 
 ## [Demo 3] Distributed Agentic RL (1 server, many clients, 1 dataset)
@@ -370,14 +361,10 @@ let say if you have 2 clients available:
 
 ```python
 N_CLIENTS = 2
-next_batch = []
+executor = PeriodicDrainThreadPoolExecutor(workers=REMOTE_BATCH_SIZE // N_CLIENTS * LOCAL_GRPO_N, max_parallel=64, auto_retry=True)
 for _, task in enumerate(dataset.generate_training_tasks()):
     for _ in range(LOCAL_GRPO_N):
-        next_batch.append(task)
-        if len(next_batch) >= (REMOTE_BATCH_SIZE // N_CLIENTS * LOCAL_GRPO_N):
-            episode_results = run_episodes_until_all_complete(next_batch, func=rollout, auto_retry=True)
-            print(episode_results)
-            next_batch.clear()
+        executor.submit_with_periodic_drain(fn=rollout, task=task)
 ```
 
 Save swarm client program as script: `swarm_client_roll.py`,

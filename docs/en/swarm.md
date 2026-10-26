@@ -38,6 +38,7 @@ Notes:
     ```bash
     ajet-swarm overwatch --swarm-url=http://localhost:10086
     ```
+    Tip: `ajet-swarm top` is an alias for `ajet-swarm overwatch`.
 
 3. changing customized port (default port is 10086):
     ```bash
@@ -63,8 +64,10 @@ Now, create a python script and start coding:
 ```python
 from ajet.tuner_lib.experimental.swarm_client import SwarmClient
 REMOTE_SWARM_URL = "http://localhost:10086" # Change to your swarm remote url
-swarm_worker = SwarmClient(REMOTE_SWARM_URL)
+swarm_worker = SwarmClient(REMOTE_SWARM_URL, auto_start_swarm_server=True)
 ```
+
+Set `auto_start_swarm_server=True` when the swarm server should run on the same machine as the client. The client will start `ajet-swarm start --swarm-port=<port>` automatically if the local port is free. This option only supports `localhost` or `127.0.0.1`; for a remote GPU server, start `ajet-swarm start` on that server and use `SwarmClient(REMOTE_SWARM_URL)`.
 
 Secondly, generate a configuration (basically VERL yaml, but slightly different), **connect** to swarm server and then tell the swarm server **which model to train**, etc. When configuration is ready, tell engine to read yaml and begin VERL training cycles with `auto_sync_train_config_and_start_engine`.
 
@@ -77,11 +80,33 @@ yaml_job = AgentJetJob(
     model='/mnt/data_cpfs/model_cache/modelscope/hub/Qwen/Qwen/Qwen2.5-3B-Instruct',
     batch_size=LOCAL_GRPO_N,
     num_repeat=4,
+    # LoRA parameters (optional, for parameter-efficient fine-tuning):
+    # lora_rank=8,           # Set > 0 to enable LoRA training (default: 0 = disabled)
+    # lora_alpha=16,         # LoRA alpha scaling factor (default: 16)
+    # lora_target_modules="all-linear",  # Target modules for LoRA (default: "all-linear")
 )
 # hint: you can `yaml_job.dump_job_as_yaml('./config.yaml')` to take a look at the full configuration
 # hint: you can `yaml_job.build_job_from_yaml('./config.yaml')` to load yaml configuration as override. (there are some configurations that must be edited from yaml)
 swarm_worker.auto_sync_train_config_and_start_engine(yaml_job)
 ```
+
+**LoRA Training**: To enable LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning, set `lora_rank > 0`. This significantly reduces GPU memory usage and training time while maintaining good performance.
+
+**Full AgentJetJob Arguments**: To see all available parameters, run `help(AgentJetJob)` in Python or check the source at `ajet/copilot/job.py`. Common parameters include:
+
+| Parameter | Description |
+|-----------|-------------|
+| `model` | Path to the model to train |
+| `n_gpu` | Number of GPUs per node |
+| `algorithm` | Advantage estimator (e.g., 'grpo') |
+| `batch_size` | Training batch size |
+| `num_repeat` | Number of repeated samples per task |
+| `max_prompt_length` | Maximum prompt token length |
+| `max_response_length` | Maximum response token length |
+| `max_model_len` | Maximum total token length |
+| `lora_rank` | LoRA rank (0 = disabled, >0 = enabled) |
+| `lora_alpha` | LoRA alpha scaling factor |
+| `lora_target_modules` | Target modules for LoRA |
 
 The swarm server can be in the following states and transition between them as follows:
 

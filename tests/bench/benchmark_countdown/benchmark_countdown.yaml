@@ -59,7 +59,7 @@ ajet:
     n_vllm_engine: 2
 
     # how many sequences are allowed to be processed in parallel by each vllm engine
-    max_num_seqs: 10
+    max_num_seqs: 64
 
     # the usage of infer engine, options: (vllm, sglang)
     name: vllm
@@ -77,7 +77,6 @@ ajet:
       top_k: -1
       top_p: 1.0
       do_sample: False
-      num_repeat: 1
 
 
   task_reader:
@@ -106,7 +105,7 @@ ajet:
     logger: swanlab
     algorithm:
       adv_estimator: grpo
-      use_kl_in_reward: False
+    use_kl_in_reward: False
     mini_batch_num: 1
     fsdp_config:
       param_offload: True
@@ -117,7 +116,8 @@ ajet:
     kl_loss_coef: 0.002
     kl_loss_type: low_var_kl
     ulysses_sequence_parallel_size: 1
-
+    # loss = loss * loss_extra_scale_ratio
+    loss_extra_scale_ratio: 10.0
 
   # DO NOT EDIT, FOR ROBOT TESTING PURPOSE ONLY. NOT FOR HUMAN.
   execute_test: True # FOR ROBOT TESTING PURPOSE ONLY. NOT FOR HUMAN.
